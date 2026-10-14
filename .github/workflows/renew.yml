@@ -1,1 +1,36 @@
+name: Neoheberg Renew
 
+on:
+  schedule:
+    - cron: "17 2 * * *"   # 每天 UTC 02:17 运行一次
+  workflow_dispatch:        # 允许手动触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run renew script
+        env:
+          NEO_EMAIL: ${{ secrets.NEO_EMAIL }}
+          NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
+        run: python renew.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: "*.png"
+          if-no-files-found: ignore
