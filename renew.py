@@ -11,13 +11,16 @@ NeoHeberg 自动续期 + 开机守护（GitHub Actions）
   NEO_VMID      服务实例 ID（必填，面板服务列表里可见）
   NEO_TYPE      服务类型，默认 vps
   RENEW_DAYS    剩余多少天时续期，默认 14
-  PROXY_SERVER  可选，如 socks5://127.0.0.1:1080（被 Cloudflare 拦截时用）
+  PROXY_SERVER  可选代理，如 socks5://127.0.0.1:1080 或 http://user:pass@host:port
+                （workflow 里配置 NODE_LINK 时由 setup_proxy.py 自动导出）
+  FORCE_RENEW   设为 true 则忽略剩余天数，强制续期（手动触发时可选）
 """
 import json
 import os
 import re
 import sys
 import time
+from urllib.parse import urlparse, unquote
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE = "https://dash.neoheberg.fr"
@@ -29,7 +32,8 @@ PASSWORD = os.environ.get("NEO_PASSWORD", "")
 VMID = os.environ.get("NEO_VMID", "")
 TYPE = os.environ.get("NEO_TYPE", "vps")
 RENEW_DAYS = int(os.environ.get("RENEW_DAYS", "14"))
-PROXY = os.environ.get("PROXY_SERVER", "")
+PROXY = os.environ.get("PROXY_SERVER", "").strip()
+FORCE_RENEW = os.environ.get("FORCE_RENEW", "").lower() in ("1", "true", "yes")
 ATTEMPTS = int(os.environ.get("LOGIN_ATTEMPTS", "3"))
 BACKOFF = [15, 60, 180]  # 登录失败后的等待秒数（站点有 429 速率限制）
 
@@ -41,6 +45,24 @@ def log(msg):
 def mask(s, show=2):
     s = str(s)
     return s if len(s) <= show * 2 else s[:show] + "*" * (len(s) - show * 2) + s[-show:]
+
+
+def build_proxy(url):
+    """PROXY_SERVER -> Playwright proxy 参数。支持 http/https/socks5，可带账号密码。"""
+    if not url:
+        return None
+    u = urlparse(url)
+    scheme = {"socks5h": "socks5"}.get(u.scheme, u.scheme)
+    if scheme not in ("http", "https", "socks5", "socks4") or not u.hostname or not u.port:
+        raise ValueError("PROXY_SERVER 格式应为 scheme://[user:pass@]host:port（http/https/socks5）")
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    proxy = {"server": f"{scheme}://{host}:{u.port}"}
+    if u.username:
+        if scheme.startswith("socks"):
+            log("⚠️ Chromium 不支持带账号密码的 SOCKS5，请改用 NODE_LINK（sing-box）或 HTTP 代理")
+        proxy["username"] = unquote(u.username)
+        proxy["password"] = unquote(u.password or "")
+    return proxy
 
 
 def snap(page, name):
@@ -148,26 +170,26 @@ def login(page, ctx):
     return False
 
 
-# ───────────────────────── 面板操作（复用浏览器 cookie 走 HTTP） ─────────────────────────
-def get_text(ctx, path):
-    return ctx.request.get(BASE + path, headers={"Accept-Language": "fr-FR"}).text()
+# ───────────────────────── 面板操作（在已登录页面内 fetch，自动走同一代理与 cookie） ─────────────────────────
+def ensure_origin(page):
+    if not page.url.startswith(BASE):
+        page.goto(BASE + "/", wait_until="domcontentloaded", timeout=60000)
 
 
-def get_json(ctx, path):
-    r = ctx.request.get(BASE + path, headers={
-        "Accept": "application/json", "X-Requested-With": "XMLHttpRequest", "Referer": BASE + "/"})
-    return json.loads(r.text())
+def panel_fetch(page, path, form=None, ajax=False):
+    ensure_origin(page)
+    return page.evaluate("""async ([path, form, ajax]) => {
+        const headers = {};
+        if (ajax) { headers['Accept'] = 'application/json'; headers['X-Requested-With'] = 'XMLHttpRequest'; }
+        const opt = { method: form ? 'POST' : 'GET', credentials: 'same-origin', headers };
+        if (form) opt.body = new URLSearchParams(form);
+        const r = await fetch(path, opt);
+        return { status: r.status, text: await r.text() };
+    }""", [path, form, ajax])
 
 
-def post(ctx, path, form, ajax=False):
-    headers = {"Origin": BASE, "Referer": BASE + "/"}
-    if ajax:
-        headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
-    return ctx.request.post(BASE + path, form=form, headers=headers, timeout=120000)
-
-
-def panel_info(ctx):
-    html = get_text(ctx, "/")
+def panel_info(page):
+    html = panel_fetch(page, "/")["text"]
     m = re.search(r'CSRF\s*=\s*["\']([^"\']+)', html) or \
         re.search(r'name="csrf_token"[^>]*value="([^"]+)"', html)
     e = re.search(r'Échéance le\s*([0-9]{2}/[0-9]{2}/[0-9]{4})', html)
@@ -177,9 +199,9 @@ def panel_info(ctx):
             int(d.group(1)) if d else None)
 
 
-def do_renew(ctx, csrf):
-    r = post(ctx, "/services/renew", {"csrf_token": csrf, "type": TYPE, "id": VMID})
-    body = r.text()
+def do_renew(page, csrf):
+    r = panel_fetch(page, "/services/renew", {"csrf_token": csrf, "type": TYPE, "id": VMID})
+    body = r["text"]
     m = re.search(r'"message"\s*:\s*"([^"]*)"', body)
     msg = ""
     if m:
@@ -187,19 +209,19 @@ def do_renew(ctx, csrf):
             msg = json.loads('"' + m.group(1) + '"')
         except Exception:
             msg = m.group(1)
-    return ("renouvel" in msg.lower()), (msg or f"HTTP {r.status}")
+    return ("renouvel" in msg.lower()), (msg or f"HTTP {r['status']}")
 
 
-def keep_running(ctx, csrf):
+def keep_running(page, csrf):
     """容器已停止则开机；失败不影响续期结果。"""
     try:
-        st = get_json(ctx, f"/app/services/vps-stats.php?id={VMID}")
+        st = json.loads(panel_fetch(page, f"/app/services/vps-stats.php?id={VMID}", ajax=True)["text"])
         status = (st.get("status") or "unknown").lower()
         log(f"容器状态: {status}")
         if status in ("stopped", "halted", "shutdown"):
-            r = post(ctx, "/app/services/vps-power.php",
-                     {"vmid": VMID, "signal": "start", "csrf_token": csrf}, ajax=True)
-            log(f"已下发开机指令: HTTP {r.status}")
+            r = panel_fetch(page, "/app/services/vps-power.php",
+                            {"vmid": VMID, "signal": "start", "csrf_token": csrf}, ajax=True)
+            log(f"已下发开机指令: HTTP {r['status']}")
     except Exception as e:
         log(f"状态/开机检查跳过: {type(e).__name__}: {str(e)[:100]}")
 
@@ -216,18 +238,29 @@ def main():
         kw = dict(headless=True, args=["--disable-blink-features=AutomationControlled",
                                        "--no-sandbox", "--disable-dev-shm-usage"])
         if PROXY:
-            kw["proxy"] = {"server": PROXY}
+            try:
+                kw["proxy"] = build_proxy(PROXY)
+            except ValueError as e:
+                log(f"❌ {e}")
+                return 1
+            log(f"使用代理: {kw['proxy']['server'].split('://')[0]}://{mask(urlparse(PROXY).hostname, 3)}")
         browser = p.chromium.launch(**kw)
         ctx = browser.new_context(user_agent=UA, locale="fr-FR",
                                   viewport={"width": 1920, "height": 1080})
         page = ctx.new_page()
         try:
+            if PROXY:  # 出口 IP 自检：确认流量确实经由代理
+                try:
+                    page.goto("https://api.ipify.org", timeout=25000)
+                    log(f"代理出口 IP: {mask(page.inner_text('body').strip(), 3)}")
+                except Exception as e:
+                    log(f"⚠️ 代理出口检查失败（继续尝试登录）: {type(e).__name__}")
             if not login(page, ctx):
                 log("❌ 登录失败")
                 return 1
             log("✅ 登录成功")
 
-            csrf, exp, days = panel_info(ctx)
+            csrf, exp, days = panel_info(page)
             log(f"到期日: {exp}  剩余: {days} 天")
             if not csrf:
                 log("❌ 未取到 CSRF token")
@@ -235,16 +268,18 @@ def main():
                 return 1
 
             rc = 0
-            if days is None or days <= RENEW_DAYS:
-                ok, msg = do_renew(ctx, csrf)
+            if FORCE_RENEW or days is None or days <= RENEW_DAYS:
+                if FORCE_RENEW:
+                    log("已指定强制续期")
+                ok, msg = do_renew(page, csrf)
                 log(f"续期{'成功' if ok else '失败'}: {msg}")
                 rc = 0 if ok else 1
-                _, exp2, days2 = panel_info(ctx)
+                _, exp2, days2 = panel_info(page)
                 log(f"续期后到期日: {exp2}  剩余: {days2} 天")
             else:
                 log(f"剩余天数 > {RENEW_DAYS}，本次无需续期")
 
-            keep_running(ctx, csrf)
+            keep_running(page, csrf)
             return rc
         finally:
             browser.close()
