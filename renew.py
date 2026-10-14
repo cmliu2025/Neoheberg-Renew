@@ -90,14 +90,47 @@ def read_csrf(page):
 
 
 # ───────────────────────── 登录 ─────────────────────────
+BLOCKED = "blocked"  # login_once 的特殊返回值：被 Cloudflare 托管质询拦截
+
+
+def cf_blocked(page):
+    """当前页面是否是 Cloudflare 质询页（注意：正常页面也会带 challenge-platform 脚本，不能只看它）。"""
+    try:
+        title = page.title()
+        html = page.content()
+    except Exception:
+        return False
+    return title.startswith(("Un instant", "Just a moment", "Attention Required")) or "_cf_chl_opt" in html
+
+
+def wait_cf_clear(page, timeout=25):
+    """遇到质询页先等一会儿（非交互式质询会自动通过）；仍未通过则返回 False。"""
+    if not cf_blocked(page):
+        return True
+    log("检测到 Cloudflare 质询页，等待自动通过 …")
+    end = time.time() + timeout
+    while time.time() < end:
+        page.wait_for_timeout(2000)
+        if not cf_blocked(page):
+            log("质询已通过")
+            return True
+    snap(page, "cloudflare_challenge")
+    return False
+
+
 def login_once(page, ctx):
     page.goto(BASE + "/login", wait_until="domcontentloaded", timeout=60000)
+    if not wait_cf_clear(page):
+        return BLOCKED
 
     # 第一步：账号
     try:
         page.wait_for_selector('input[name="identifier"]', timeout=45000)
     except PWTimeout:
-        log("登录表单未渲染（站点可能返回了残缺页面，或被 Cloudflare 拦截）")
+        if cf_blocked(page):
+            snap(page, "cloudflare_challenge")
+            return BLOCKED
+        log("登录表单未渲染（站点可能返回了残缺页面）")
         snap(page, "login_no_form")
         return False
     page.fill('input[name="identifier"]', USER)
@@ -148,6 +181,10 @@ def login_once(page, ctx):
     names = {c["name"] for c in ctx.cookies()}
     if "__Host-NH-Remember" in names or "/login" not in page.url:
         return True
+    if cf_blocked(page):
+        log("提交登录后被 Cloudflare 质询拦截")
+        snap(page, "cloudflare_challenge")
+        return BLOCKED
     log(f"登录未成功，当前 URL: {page.url}")
     snap(page, "login_failed")
     return False
@@ -162,8 +199,14 @@ def login(page, ctx):
         else:
             log(f"第 {i}/{ATTEMPTS} 次登录尝试 …")
         try:
-            if login_once(page, ctx):
+            res = login_once(page, ctx)
+            if res is True:
                 return True
+            if res == BLOCKED:
+                log("❌ 被 Cloudflare 托管质询（Turnstile）拦截：GitHub 机房 IP 信誉低，重试只会更糟，已停止。")
+                log("   解决办法：配置 Secret NODE_LINK 或 PROXY_SERVER，使用干净的固定出口 IP"
+                    "（住宅/家宽 IP 最稳），或改用自托管 runner。")
+                return False
         except Exception as e:
             log(f"登录异常: {type(e).__name__}: {str(e)[:150]}")
             snap(page, "login_error")
