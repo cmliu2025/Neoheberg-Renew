@@ -2,13 +2,22 @@ name: Neoheberg Renew
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # 每天 UTC 02:00（北京时间 10:00）
-  workflow_dispatch:
+    - cron: "0 2 * * 1"     # 每周一 UTC 02:00（北京时间 10:00）
+  workflow_dispatch:         # 可在 Actions 页面手动触发
+    inputs:
+      force_renew:
+        description: "忽略剩余天数，强制续期"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write            # 保活：必要时提交一个空 commit
+  actions: write             # 保活：重新启用本 workflow
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -21,12 +30,29 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
+      # 代理（二选一，都不配置则直连）：
+      #   NODE_LINK    节点分享链接（vless/vmess/trojan/ss/hysteria2/tuic/socks5/http），经 sing-box 转成本地 SOCKS5
+      #   PROXY_SERVER 现成的代理地址，如 http://user:pass@host:port 或 socks5://host:port
+      - name: Setup proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          USER_PROXY: ${{ secrets.PROXY_SERVER }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            python setup_proxy.py
+          elif [ -n "$USER_PROXY" ]; then
+            echo "PROXY_SERVER=$USER_PROXY" >> "$GITHUB_ENV"
+            echo "使用 PROXY_SERVER secret 提供的代理"
+          else
+            echo "未配置代理，直连"
+          fi
+
       - name: Run renew script
         env:
           NEO_USER: ${{ secrets.NEO_USER }}
           NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
           NEO_VMID: ${{ secrets.NEO_VMID }}
-          # PROXY_SERVER: socks5://127.0.0.1:1080   # 被 Cloudflare 拦截时再启用
+          FORCE_RENEW: ${{ inputs.force_renew }}
         run: python renew.py
 
       - name: Upload debug files
@@ -38,3 +64,21 @@ jobs:
             *.png
             *.html
           if-no-files-found: ignore
+
+      # 仓库保活：GitHub 会在公开仓库 60 天无活动后自动停用定时任务。
+      # 距上次提交超过 45 天就补一个空 commit；同时调用一次 enable 作为双保险。
+      - name: Keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(git log -1 --format=%ct)
+          age=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "距上次提交 ${age} 天"
+          if [ "$age" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive"
+            git push || echo "push 失败（已忽略）"
+          fi
+          gh workflow enable "${{ github.workflow }}" || true
