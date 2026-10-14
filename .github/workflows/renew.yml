@@ -2,13 +2,13 @@ name: Neoheberg Renew
 
 on:
   schedule:
-    - cron: "17 2 * * *"   # 每天 UTC 02:17 运行一次
-  workflow_dispatch:        # 允许手动触发
+    - cron: "0 2 * * *"   # 每天 UTC 02:00（北京时间 10:00）
+  workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -23,15 +23,17 @@ jobs:
 
       - name: Run renew script
         env:
-          NEO_EMAIL: ${{ secrets.NEO_EMAIL }}
+          NEO_USER: ${{ secrets.NEO_USER }}
           NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
+          NEO_VMID: ${{ secrets.NEO_VMID }}
+          # PROXY_SERVER: socks5://127.0.0.1:1080   # 被 Cloudflare 拦截时再启用
         run: python renew.py
 
-      - name: Upload screenshots
-        if: always()
+      - name: Upload debug files
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
+          name: debug
           path: |
             *.png
             *.html
