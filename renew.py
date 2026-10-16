@@ -27,9 +27,9 @@ BASE = "https://dash.neoheberg.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-USER = os.environ.get("NEO_USER", "")
-PASSWORD = os.environ.get("NEO_PASSWORD", "")
-VMID = os.environ.get("NEO_VMID", "")
+USER = os.environ.get("NEO_USER", "").strip()
+PASSWORD = os.environ.get("NEO_PASSWORD", "").strip()
+VMID = os.environ.get("NEO_VMID", "").strip()
 TYPE = os.environ.get("NEO_TYPE", "vps")
 RENEW_DAYS = int(os.environ.get("RENEW_DAYS", "14"))
 PROXY = os.environ.get("PROXY_SERVER", "").strip()
@@ -90,7 +90,8 @@ def read_csrf(page):
 
 
 # ───────────────────────── 登录 ─────────────────────────
-BLOCKED = "blocked"  # login_once 的特殊返回值：被 Cloudflare 托管质询拦截
+BLOCKED = "blocked"      # login_once 的特殊返回值：被 Cloudflare 托管质询拦截
+BADCREDS = "badcreds"    # login_once 的特殊返回值：站点提示账号或密码无效
 
 
 def cf_blocked(page):
@@ -185,8 +186,18 @@ def login_once(page, ctx):
         log("提交登录后被 Cloudflare 质询拦截")
         snap(page, "cloudflare_challenge")
         return BLOCKED
-    log(f"登录未成功，当前 URL: {page.url}")
+    try:
+        err = page.evaluate("""() => { const a = document.querySelector('[role=alert], .alert-card');
+                                       return a ? a.innerText.trim() : ''; }""")
+    except Exception:
+        err = ""
+    err = re.sub(r"\s+", " ", err or "")
+    if err:
+        log(f"站点提示: {err}")
     snap(page, "login_failed")
+    if re.search(r"invalide|invalid|incorrect", err, re.I):
+        return BADCREDS
+    log(f"登录未成功，当前 URL: {page.url}")
     return False
 
 
@@ -202,6 +213,10 @@ def login(page, ctx):
             res = login_once(page, ctx)
             if res is True:
                 return True
+            if res == BADCREDS:
+                log("❌ 账号或密码被站点拒绝，已停止重试（继续重试可能触发限流或锁号）。")
+                log("   请检查 Secrets 中的 NEO_USER / NEO_PASSWORD，并确认该账号设置过密码（Discord 登录的账号默认没有密码）。")
+                return False
             if res == BLOCKED:
                 log("❌ 被 Cloudflare 托管质询（Turnstile）拦截：GitHub 机房 IP 信誉低，重试只会更糟，已停止。")
                 log("   解决办法：配置 Secret NODE_LINK 或 PROXY_SERVER，使用干净的固定出口 IP"
@@ -275,7 +290,7 @@ def main():
     if missing:
         log(f"缺少环境变量: {', '.join(missing)}")
         return 1
-    log(f"账号={mask(USER)} 实例={mask(VMID)} 续期阈值={RENEW_DAYS}天")
+    log(f"账号={mask(USER)}（{len(USER)}位） 密码={len(PASSWORD)}位 实例={mask(VMID)} 续期阈值={RENEW_DAYS}天")
 
     with sync_playwright() as p:
         kw = dict(headless=True, args=["--disable-blink-features=AutomationControlled",
