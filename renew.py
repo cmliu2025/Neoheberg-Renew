@@ -26,26 +26,47 @@ NeoHeberg 自动续期 + 开机守护（GitHub Actions，支持多账号）
                 （workflow 里配置 NODE_LINK 时由 setup_proxy.py 自动导出）
   FORCE_RENEW   设为 true 则忽略剩余天数，强制续期
   ACCOUNT_GAP   账号之间的间隔秒数（另加 0~15 秒随机），默认 30
+
+代理降级规则（每个账号独立判断，不可用的代理绝不会悄悄改成直连）：
+  · 有专用代理 → 先用专用代理；连不上或出口被 Cloudflare 拦截，则自动改用全局代理
+  · 没有专用代理 → 用全局代理；全局代理失效则该账号被取消
+  · 全局代理与专用代理都失效/被拦截 → 该账号被取消；所有账号都被取消则整体失败退出
+  · 某个出口被 Cloudflare 拦截后，本次运行内不再让其他账号去撞这个出口
+  · 一个代理都没配置 → 直连
+
+Telegram 推送（可选）：
+  TG_BOT_TOKEN  机器人 Token（@BotFather 创建）
+  TG_CHAT_ID    接收消息的 Chat ID
+  TG_NOTIFY     always(默认,每次都发) / change(有续期或失败或代理降级才发) / fail(仅失败才发)
 """
+import html
 import json
 import os
 import random
 import re
 import sys
 import time
-from urllib.parse import urlparse, unquote
+from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse, unquote
+from urllib.request import Request, urlopen
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE = "https://dash.neoheberg.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-DEFAULT_TYPE = os.environ.get("NEO_TYPE", "vps").strip() or "vps"
-RENEW_DAYS = int(os.environ.get("RENEW_DAYS", "14"))
+DEFAULT_TYPE = (os.environ.get("NEO_TYPE") or "vps").strip()
+RENEW_DAYS = int(os.environ.get("RENEW_DAYS") or 14)
 PROXY = os.environ.get("PROXY_SERVER", "").strip()
 FORCE_RENEW = os.environ.get("FORCE_RENEW", "").lower() in ("1", "true", "yes")
-ATTEMPTS = int(os.environ.get("LOGIN_ATTEMPTS", "3"))
-ACCOUNT_GAP = int(os.environ.get("ACCOUNT_GAP", "30"))
+# setup_proxy.py 在 NODE_LINK 启动失败时写入；表示"配置了全局代理但它不可用"
+GLOBAL_PROXY_FAILED = os.environ.get("GLOBAL_PROXY_FAILED", "").lower() in ("1", "true", "yes")
+TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT = os.environ.get("TG_CHAT_ID", "").strip()
+TG_NOTIFY = (os.environ.get("TG_NOTIFY", "") or "always").strip().lower()  # always / change / fail
+ATTEMPTS = int(os.environ.get("LOGIN_ATTEMPTS") or 3)
+ACCOUNT_GAP = int(os.environ.get("ACCOUNT_GAP") or 30)
 BACKOFF = [15, 60, 180]  # 登录失败后的等待秒数（站点有 429 速率限制）
 
 LABEL = ""      # 当前账号标签，用于日志前缀
@@ -369,10 +390,150 @@ def keep_running(page, csrf, acc):
         log(f"状态/开机检查跳过: {type(e).__name__}: {str(e)[:100]}")
 
 
+# ───────────────────────── 代理选择 ─────────────────────────
+PROXY_CACHE = {}  # 代理 URL -> 出口 IP / None，同一个代理只检测一次
+
+
+def check_proxy(p, url):
+    """经该代理访问 ipify。成功返回出口 IP，失败返回 None（结果按 URL 缓存）。"""
+    if url in PROXY_CACHE:
+        return PROXY_CACHE[url]
+    try:
+        pr = build_proxy(url)
+    except ValueError as e:
+        log(f"⚠️ {e}")
+        PROXY_CACHE[url] = None
+        return None
+    ip = None
+    for attempt in (1, 2):  # 偶发抖动给一次重试机会
+        browser = None
+        try:
+            browser = p.chromium.launch(headless=True, proxy=pr,
+                                        args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page()
+            page.goto("https://api.ipify.org", timeout=20000)
+            text = page.inner_text("body").strip()
+            ip = text if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", text) else None
+        except Exception:
+            ip = None
+        finally:
+            if browser:
+                browser.close()
+        if ip:
+            break
+        if attempt == 1:
+            time.sleep(3)
+    PROXY_CACHE[url] = ip
+    return ip
+
+
+def iter_choices(p, acc, blocked_keys, info):
+    """按优先级依次产出该账号可用的出口：专用代理 → 全局代理。
+
+    调用方用完一个出口后若发现它被 Cloudflare 拦截，把它加入 blocked_keys 再取下一个即可。
+    规则：
+      · 有专用代理 → 先用专用代理；不可用（连不上）或被 Cloudflare 拦截 → 自动改用全局代理
+      · 没有专用代理 → 用全局代理；全局代理不可用 → 取消该账号（不直连）
+      · 全局代理（含 NODE_LINK 启动失败）与专用代理都不可用/被拦截 → 取消该账号
+      · 完全没有配置任何代理 → 直连
+    取消原因写入 info["note"]。
+    """
+    cands = []
+    if acc["proxy"]:
+        cands.append(("专用代理", acc["proxy"]))
+    if PROXY and PROXY != acc["proxy"]:
+        cands.append(("全局代理", PROXY))
+
+    if not cands:
+        if GLOBAL_PROXY_FAILED:
+            log("❌ 全局代理不可用，且该账号未配置专用代理，已取消（不会直连）")
+            info["note"] = "全局代理失效且无专用代理，已取消"
+        elif "(direct)" in blocked_keys:
+            log("⏭ 跳过：直连出口已被 Cloudflare 拦截，继续尝试只会更糟")
+            info["note"] = "跳过（出口 IP 已被拦截）"
+        else:
+            yield {"url": None, "via": "直连", "key": "(direct)"}
+        return
+
+    if GLOBAL_PROXY_FAILED and not PROXY:
+        log("⚠️ 全局代理（NODE_LINK）启动失败，仅尝试该账号的专用代理")
+
+    reason, skipped_blocked = "", False
+    for name, url in cands:
+        if url in blocked_keys:
+            log(f"⏭ {name}出口已被 Cloudflare 拦截，跳过")
+            skipped_blocked, reason = True, "被拦截"
+            continue
+        ip = check_proxy(p, url)
+        if not ip:
+            log(f"⚠️ {name}不可用")
+            reason = "失效"
+            continue
+        via = name
+        if reason:
+            via = f"{name}（专用代理{reason}）"
+            log(f"⚠️ 专用代理{reason}，已自动改用{name}")
+        log(f"{name}可用，出口 IP: {mask(ip, 3)}")
+        yield {"url": url, "via": via, "key": url}
+        reason = "被拦截"  # 调用方回来继续取下一个，说明刚才这个出口被 Cloudflare 拦截了
+
+    info["note"] = "跳过（出口 IP 已被拦截）" if skipped_blocked else "代理全部失效，已取消"
+
+
+# ───────────────────────── Telegram 推送 ─────────────────────────
+def tg_send(text):
+    """发送 Telegram 消息。任何失败都只记录日志，绝不影响续期结果（也不会把 token 打到日志里）。"""
+    if not (TG_TOKEN and TG_CHAT):
+        return False
+    try:
+        data = urlencode({"chat_id": TG_CHAT, "text": text[:3900], "parse_mode": "HTML",
+                          "disable_web_page_preview": "true"}).encode()
+        req = Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data)
+        with urlopen(req, timeout=20) as r:
+            ok = r.status == 200
+        log("📨 Telegram 推送成功" if ok else "⚠️ Telegram 推送失败")
+        return ok
+    except HTTPError as e:
+        hint = {401: "（Bot Token 无效）", 400: "（Chat ID 无效，或还没给机器人发过消息）",
+                403: "（机器人被拉黑或无权限）"}.get(e.code, "")
+        log(f"⚠️ Telegram 推送失败: HTTP {e.code}{hint}")
+    except Exception as e:
+        log(f"⚠️ Telegram 推送失败: {type(e).__name__}")
+    return False
+
+
+def should_notify(results, errors):
+    if errors and not results:
+        return True
+    failed = any(s == "failed" for _, s, _, _ in results)
+    changed = any(s == "renewed" or "（" in v for _, s, _, v in results)
+    return {"always": True, "fail": failed, "change": failed or changed}.get(TG_NOTIFY, True)
+
+
+def build_report(results, errors):
+    bj = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    icon = {"renewed": "✅", "ok": "✔️", "failed": "❌"}
+    failed = sum(1 for _, s, _, _ in results if s == "failed")
+    lines = [f"<b>NeoHeberg 续期报告</b>", f"🕐 {bj}（北京时间）", ""]
+    for name, status, note, via in results:
+        tail = f" · <i>{html.escape(via)}</i>" if "（" in via else ""
+        lines.append(f"{icon[status]} <b>{html.escape(name)}</b>：{html.escape(note)}{tail}")
+    for e in errors:
+        lines.append(f"⚠️ 配置提示：{html.escape(e)}")
+    lines += ["", f"成功 {len(results) - failed} / 失败 {failed} / 共 {len(results)}"]
+    repo, run = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID")
+    if repo and run:
+        lines.append(f'<a href="{os.environ.get("GITHUB_SERVER_URL", "https://github.com")}/{repo}/actions/runs/{run}">查看运行日志</a>')
+    return "\n".join(lines)
+
+
 # ───────────────────────── 单个账号 ─────────────────────────
-def process_account(p, acc):
-    """处理一个账号。返回 dict: status(renewed/ok/failed), note, blocked(bool)。"""
-    proxy_url = acc["proxy"] or PROXY
+def process_account(p, acc, choice):
+    """处理一个账号（出口已由 iter_choices 选好）。返回 dict: status(renewed/ok/failed), note, blocked, via。"""
+    via = choice["via"]
+    result = lambda status, note, blocked=False: {"status": status, "note": note, "blocked": blocked, "via": via}
+
+    proxy_url = choice["url"]
     kw = dict(headless=True, args=["--disable-blink-features=AutomationControlled",
                                    "--no-sandbox", "--disable-dev-shm-usage"])
     if proxy_url:
@@ -380,9 +541,8 @@ def process_account(p, acc):
             kw["proxy"] = build_proxy(proxy_url)
         except ValueError as e:
             log(f"❌ {e}")
-            return {"status": "failed", "note": "代理配置错误", "blocked": False}
-        src = "专用" if acc["proxy"] else "全局"
-        log(f"使用{src}代理: {kw['proxy']['server'].split('://')[0]}://{mask(urlparse(proxy_url).hostname, 3)}")
+            return result("failed", "代理配置错误")
+        log(f"使用{via}: {kw['proxy']['server'].split('://')[0]}://{mask(urlparse(proxy_url).hostname, 3)}")
 
     browser = p.chromium.launch(**kw)
     try:
@@ -390,17 +550,10 @@ def process_account(p, acc):
         page = ctx.new_page()
         page.set_default_timeout(30000)
         try:
-            if proxy_url:  # 出口 IP 自检：确认流量确实经由代理
-                try:
-                    page.goto("https://api.ipify.org", timeout=25000)
-                    log(f"代理出口 IP: {mask(page.inner_text('body').strip(), 3)}")
-                except Exception as e:
-                    log(f"⚠️ 代理出口检查失败（继续尝试登录）: {type(e).__name__}")
-
             res = login(page, ctx, acc["user"], acc["password"])
             if res is not True:
                 note = {BLOCKED: "被 Cloudflare 拦截", BADCREDS: "账号或密码错误"}.get(res, "登录失败")
-                return {"status": "failed", "note": note, "blocked": res == BLOCKED}
+                return result("failed", note, res == BLOCKED)
             log("✅ 登录成功")
 
             csrf, exp, days = panel_info(page)
@@ -408,7 +561,7 @@ def process_account(p, acc):
             if not csrf:
                 log("❌ 未取到 CSRF token")
                 snap(page, "no_csrf")
-                return {"status": "failed", "note": "未取到 CSRF token", "blocked": False}
+                return result("failed", "未取到 CSRF token")
 
             threshold = acc["renew_days"]
             if FORCE_RENEW or days is None or days <= threshold:
@@ -420,16 +573,16 @@ def process_account(p, acc):
                 log(f"续期后到期日: {exp2}  剩余: {days2} 天")
                 keep_running(page, csrf, acc)
                 if ok:
-                    return {"status": "renewed", "note": f"续期成功（剩余 {days} → {days2} 天）", "blocked": False}
-                return {"status": "failed", "note": f"续期失败: {msg}", "blocked": False}
+                    return result("renewed", f"续期成功（剩余 {days} → {days2} 天）")
+                return result("failed", f"续期失败: {msg}")
 
             log(f"剩余天数 > {threshold}，本次无需续期")
             keep_running(page, csrf, acc)
-            return {"status": "ok", "note": f"无需续期（剩余 {days} 天）", "blocked": False}
+            return result("ok", f"无需续期（剩余 {days} 天）")
         except Exception as e:
             log(f"❌ 处理异常: {type(e).__name__}: {str(e)[:150]}")
             snap(page, "error")
-            return {"status": "failed", "note": f"异常: {type(e).__name__}", "blocked": False}
+            return result("failed", f"异常: {type(e).__name__}")
     finally:
         browser.close()
 
@@ -437,11 +590,16 @@ def process_account(p, acc):
 # ───────────────────────── 主流程 ─────────────────────────
 def main():
     global LABEL, FILE_TAG
+    for secret in (TG_TOKEN, TG_CHAT):  # 让 Actions 日志屏蔽 TG 凭据
+        if secret:
+            print(f"::add-mask::{secret}", flush=True)
+
     accounts, errors = parse_accounts()
     for e in errors:
         log(f"⚠️ 配置问题: {e}")
     if not accounts:
         log("❌ 没有可用的账号配置")
+        tg_send("❌ <b>NeoHeberg 续期</b>：没有可用的账号配置\n" + "\n".join(html.escape(e) for e in errors))
         return 1
 
     # 让 Actions 日志屏蔽账号和密码（防止公开仓库泄露）
@@ -458,33 +616,45 @@ def main():
         for i, acc in enumerate(accounts, 1):
             LABEL = acc["name"] if total > 1 else ""
             FILE_TAG = f"acc{i}_" if total > 1 else ""
-            key = acc["proxy"] or "(global)"
 
-            if key in blocked_keys:
-                log("⏭ 跳过：同一出口 IP 已被 Cloudflare 拦截，继续尝试只会更糟")
-                results.append((acc["name"], "failed", "跳过（出口 IP 被拦截）"))
-                continue
+            info, final, last_blocked, tried = {}, None, None, 0
+            for choice in iter_choices(p, acc, blocked_keys, info):
+                if tried:
+                    time.sleep(5)  # 同一账号换出口重试前稍等
+                elif ran:  # 账号之间留间隔，避免触发站点限流
+                    gap = ACCOUNT_GAP + random.uniform(0, 15)
+                    log(f"等待 {gap:.0f}s 后处理下一个账号 …")
+                    time.sleep(gap)
+                ran, tried = True, tried + 1
 
-            if ran:  # 账号之间留间隔，避免触发站点限流
-                gap = ACCOUNT_GAP + random.uniform(0, 15)
-                log(f"等待 {gap:.0f}s 后处理下一个账号 …")
-                time.sleep(gap)
-            ran = True
+                if tried == 1:
+                    log(f"开始处理（{i}/{total}）：账号={mask(acc['user'])}（{len(acc['user'])}位） "
+                        f"密码={len(acc['password'])}位 实例={mask(acc['vmid'])}")
+                res = process_account(p, acc, choice)
+                if res["blocked"]:  # 被 Cloudflare 拦截：记下这个出口，尝试下一个
+                    blocked_keys.add(choice["key"])
+                    last_blocked = res
+                    continue
+                final = res
+                break
 
-            log(f"开始处理（{i}/{total}）：账号={mask(acc['user'])}（{len(acc['user'])}位） "
-                f"密码={len(acc['password'])}位 实例={mask(acc['vmid'])}")
-            res = process_account(p, acc)
-            if res["blocked"]:
-                blocked_keys.add(key)
-            results.append((acc["name"], res["status"], res["note"]))
+            if final is None:
+                if last_blocked:
+                    final = dict(last_blocked, note="被 Cloudflare 拦截" + ("（所有出口均被拦截）" if tried > 1 else ""))
+                else:
+                    final = {"status": "failed", "note": info.get("note", "代理全部失效，已取消"), "via": ""}
+            results.append((acc["name"], final["status"], final["note"], final["via"]))
 
     LABEL = ""
     log("═════════ 汇总 ═════════")
     icon = {"renewed": "✅", "ok": "✔️", "failed": "❌"}
-    for name, status, note in results:
-        log(f"{icon[status]} {name}: {note}")
-    failed = sum(1 for _, s, _ in results if s == "failed")
+    for name, status, note, via in results:
+        log(f"{icon[status]} {name}: {note}" + (f"  [{via}]" if via else ""))
+    failed = sum(1 for _, s, _, _ in results if s == "failed")
     log(f"成功 {len(results) - failed} / 失败 {failed} / 共 {len(results)}")
+
+    if should_notify(results, errors):
+        tg_send(build_report(results, errors))
     return 1 if failed else 0
 
 

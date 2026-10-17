@@ -4,6 +4,7 @@
 
 支持: vless / vmess / trojan / ss / hysteria2(hy2) / tuic / socks5 / http
 成功后把 PROXY_SERVER=socks5://127.0.0.1:1080 写入 $GITHUB_ENV，供 renew.py 使用。
+失败时不中断 workflow，而是写入 GLOBAL_PROXY_FAILED=1，由 renew.py 按账号决定是否继续。
 
 用法:
   NODE_LINK='vless://...' python setup_proxy.py
@@ -273,6 +274,23 @@ def wait_port(timeout=20):
     return False
 
 
+def mark_failed():
+    """全局代理不可用时留下标记，由 renew.py 决定：有专用代理的账号继续，没有的取消。"""
+    env_file = os.environ.get("GITHUB_ENV")
+    if env_file:
+        with open(env_file, "a") as f:
+            f.write("GLOBAL_PROXY_FAILED=1\n")
+    else:
+        print("export GLOBAL_PROXY_FAILED=1")
+
+
+def fail(msg):
+    print(f"⚠️ 全局代理不可用: {msg}")
+    print("   后续：配置了专用代理的账号继续登录；未配置专用代理的账号将被取消。")
+    mark_failed()
+    return 0  # 不让整个 workflow 在这里中断
+
+
 def main():
     link = os.environ.get("NODE_LINK", "").strip()
     if not link:
@@ -281,8 +299,7 @@ def main():
     try:
         outbound = parse_link(link)
     except Exception as e:
-        print(f"❌ 节点链接解析失败: {type(e).__name__}: {e}")
-        return 1
+        return fail(f"节点链接解析失败: {type(e).__name__}: {e}")
     print(f"节点: {outbound['type']} @ {mask(outbound['server'], 3)}:{outbound['server_port']}")
 
     os.makedirs(WORKDIR, exist_ok=True)
@@ -293,27 +310,26 @@ def main():
         print("配置已生成:", cfg_path)
         return 0
 
-    binp = ensure_singbox()
+    try:
+        binp = ensure_singbox()
+    except Exception as e:
+        return fail(f"sing-box 下载失败: {type(e).__name__}: {str(e)[:100]}")
     chk = subprocess.run([binp, "check", "-c", cfg_path], capture_output=True, text=True)
     if chk.returncode != 0:
-        print("❌ sing-box 配置校验失败:", chk.stderr.strip()[:300])
-        return 1
+        return fail("sing-box 配置校验失败: " + chk.stderr.strip()[:200])
 
     logf = open(os.path.join(WORKDIR, "sing-box.log"), "w")
     subprocess.Popen([binp, "run", "-c", cfg_path], stdout=logf, stderr=subprocess.STDOUT,
                      start_new_session=True)
     if not wait_port():
-        print("❌ sing-box 未能启动")
-        print(open(os.path.join(WORKDIR, "sing-box.log")).read()[-500:])
-        return 1
+        return fail("sing-box 未能启动")
 
     # 连通性自检：经代理访问外网，确认节点可用
     r = subprocess.run(["curl", "-sS", "--max-time", "25", "--socks5-hostname",
                         f"127.0.0.1:{PORT}", "https://api.ipify.org"], capture_output=True, text=True)
     ip = r.stdout.strip()
     if r.returncode != 0 or not ip:
-        print("❌ 代理连通性检查失败（节点不可用？）:", r.stderr.strip()[:200])
-        return 1
+        return fail("节点连通性检查失败: " + r.stderr.strip()[:150])
     print(f"✅ 代理可用，出口 IP: {mask(ip, 3)}")
 
     proxy = f"socks5://127.0.0.1:{PORT}"
