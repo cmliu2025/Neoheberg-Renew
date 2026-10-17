@@ -12,10 +12,12 @@ NeoHeberg 自动续期 + 开机守护（GitHub Actions，支持多账号）
          {"user": "账号1", "password": "密码1", "vmid": "12345"},
          {"user": "账号2", "password": "密码2", "vmid": "67890", "proxy": "http://u:p@1.2.3.4:8080"}
        ]
-     可选字段: name(日志里的别名) / type(默认 vps) / renew_days / proxy(该账号专用代理，缺省用全局代理)
-     或每行一个（密码可含 | 以外的任意字符，# 开头为注释）：
+     可选字段: name(日志里的别名) / type(默认 vps) / renew_days
+              node(该账号自己的节点链接，vless/vmess/trojan/ss/hysteria2/tuic/socks5/http；
+                   旧字段名 proxy 仍然兼容，缺省则用全局代理)
+     或每行一个（# 开头为注释；密码里可以含 |）：
        账号1|密码1|12345
-       账号2|密码2|67890
+       账号2|密码2|67890|vless://...      ← 第 4 段起为该账号的节点链接（可省略）
   ② 单账号（兼容旧配置）：NEO_USER / NEO_PASSWORD / NEO_VMID
   两种可同时存在：旧的单账号变量会作为第一个账号，与 NEO_ACCOUNTS 合并处理（相同账号+实例自动去重）。
 
@@ -27,12 +29,13 @@ NeoHeberg 自动续期 + 开机守护（GitHub Actions，支持多账号）
   FORCE_RENEW   设为 true 则忽略剩余天数，强制续期
   ACCOUNT_GAP   账号之间的间隔秒数（另加 0~15 秒随机），默认 30
 
-代理降级规则（每个账号独立判断，不可用的代理绝不会悄悄改成直连）：
-  · 有专用代理 → 先用专用代理；连不上或出口被 Cloudflare 拦截，则自动改用全局代理
-  · 没有专用代理 → 用全局代理；全局代理失效则该账号被取消
-  · 全局代理与专用代理都失效/被拦截 → 该账号被取消；所有账号都被取消则整体失败退出
-  · 某个出口被 Cloudflare 拦截后，本次运行内不再让其他账号去撞这个出口
-  · 一个代理都没配置 → 直连
+代理规则（每个账号独立判断，不可用的代理绝不会悄悄改成直连）：
+  · 账号配置了 node → 只走该节点（脚本为它启动一个独立的本地 sing-box）；
+    节点启动失败 / 连不通 / 被 Cloudflare 拦截 → 该账号被取消，不会换到其他出口
+  · 账号没配 node → 用全局代理（NODE_LINK / PROXY_SERVER）；全局代理失效则该账号被取消
+  · 全局代理也没配 → 直连
+  · 多个账号填同一条节点链接时共用一个 sing-box 实例
+  · 某个出口被 Cloudflare 拦截后，本次运行内不再让其他共用该出口的账号去撞
 
 Telegram 推送（可选）：
   TG_BOT_TOKEN  机器人 Token（@BotFather 创建）
@@ -51,6 +54,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse, unquote
 from urllib.request import Request, urlopen
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+import setup_proxy as sp  # 节点链接 -> 本地 SOCKS5（sing-box）
 
 BASE = "https://dash.neoheberg.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -92,7 +97,7 @@ def _norm(entry, idx):
         "password": g("password", "pass", "pwd"),
         "vmid": g("vmid", "id"),
         "type": g("type") or DEFAULT_TYPE,
-        "proxy": g("proxy"),
+        "node": g("node", "node_link", "nodelink", "link", "proxy"),  # proxy 为旧字段名，兼容
         "name": g("name", "label") or f"#{idx}",
     }
     rd = g("renew_days")
@@ -129,8 +134,15 @@ def parse_accounts():
                 if len(parts) < 3:
                     entries.append({})  # 占位，让后面报"缺少字段"
                     continue
+                # 从第 3 段起找第一个形如 scheme:// 的段，它及其后面都算节点链接，前一段是 vmid
+                node = ""
+                for j in range(2, len(parts)):
+                    if re.match(r"^\s*[a-z][a-z0-9+.-]*://", parts[j], re.I):
+                        node, parts = "|".join(parts[j:]).strip(), parts[:j]
+                        break
                 # 账号取第一段、vmid 取最后一段，中间都算密码（密码里可以有 |）
-                entries.append({"user": parts[0], "password": "|".join(parts[1:-1]), "vmid": parts[-1]})
+                entries.append({"user": parts[0], "password": "|".join(parts[1:-1]), "vmid": parts[-1],
+                                "node": node})
 
     accounts, errors, seen = [], [], set()
     for i, e in enumerate(entries, 1):
@@ -427,57 +439,85 @@ def check_proxy(p, url):
     return ip
 
 
-def iter_choices(p, acc, blocked_keys, info):
-    """按优先级依次产出该账号可用的出口：专用代理 → 全局代理。
+NODES = {}  # 节点链接 -> {"proc", "url"}；启动失败记为 None（同一条链接只启动一次，多账号共用）
 
-    调用方用完一个出口后若发现它被 Cloudflare 拦截，把它加入 blocked_keys 再取下一个即可。
-    规则：
-      · 有专用代理 → 先用专用代理；不可用（连不上）或被 Cloudflare 拦截 → 自动改用全局代理
-      · 没有专用代理 → 用全局代理；全局代理不可用 → 取消该账号（不直连）
-      · 全局代理（含 NODE_LINK 启动失败）与专用代理都不可用/被拦截 → 取消该账号
-      · 完全没有配置任何代理 → 直连
-    取消原因写入 info["note"]。
+
+def ensure_node(link):
+    """为账号的节点链接启动本地 sing-box，返回 socks5://127.0.0.1:端口；失败返回 None。"""
+    if link in NODES:
+        return NODES[link]["url"] if NODES[link] else None
+    scheme = link.split("://", 1)[0].lower() if "://" in link else ""
+    if scheme not in sp.PARSERS:
+        log(f"⚠️ 节点链接格式不对或协议不支持: {scheme or '缺少 scheme://'}")
+        NODES[link] = None
+        return None
+    log(f"启动账号节点（{scheme}）…")
+    try:
+        proc, url = sp.start_node(link)
+    except Exception as e:
+        log(f"⚠️ 节点启动失败: {type(e).__name__}: {str(e)[:150]}")
+        NODES[link] = None
+        return None
+    NODES[link] = {"proc": proc, "url": url}
+    return url
+
+
+def stop_nodes():
+    for n in NODES.values():
+        try:
+            if n and n["proc"].poll() is None:
+                n["proc"].terminate()
+        except Exception:
+            pass
+
+
+def resolve_exit(p, acc, blocked_keys, info):
+    """决定该账号的出口，返回 {"url", "via", "key"}；不可用则返回 None 并把原因写入 info["note"]。
+
+      · 账号配置了 node → 只走自己的节点；启动失败 / 连不通 / 已被拦截 → 取消（不换出口、不直连）
+      · 没配 node → 用全局代理（NODE_LINK / PROXY_SERVER）；全局代理失效 → 取消
+      · 全局代理也没配 → 直连
     """
-    cands = []
-    if acc["proxy"]:
-        cands.append(("专用代理", acc["proxy"]))
-    if PROXY and PROXY != acc["proxy"]:
-        cands.append(("全局代理", PROXY))
-
-    if not cands:
-        if GLOBAL_PROXY_FAILED:
-            log("❌ 全局代理不可用，且该账号未配置专用代理，已取消（不会直连）")
-            info["note"] = "全局代理失效且无专用代理，已取消"
-        elif "(direct)" in blocked_keys:
-            log("⏭ 跳过：直连出口已被 Cloudflare 拦截，继续尝试只会更糟")
+    if acc["node"]:
+        key = acc["node"]
+        if key in blocked_keys:
+            log("⏭ 跳过：该节点的出口已被 Cloudflare 拦截，继续尝试只会更糟")
             info["note"] = "跳过（出口 IP 已被拦截）"
-        else:
-            yield {"url": None, "via": "直连", "key": "(direct)"}
-        return
-
-    if GLOBAL_PROXY_FAILED and not PROXY:
-        log("⚠️ 全局代理（NODE_LINK）启动失败，仅尝试该账号的专用代理")
-
-    reason, skipped_blocked = "", False
-    for name, url in cands:
-        if url in blocked_keys:
-            log(f"⏭ {name}出口已被 Cloudflare 拦截，跳过")
-            skipped_blocked, reason = True, "被拦截"
-            continue
+            return None
+        url = ensure_node(acc["node"])
+        if not url:
+            info["note"] = "账号节点启动失败，已取消"
+            return None
         ip = check_proxy(p, url)
         if not ip:
-            log(f"⚠️ {name}不可用")
-            reason = "失效"
-            continue
-        via = name
-        if reason:
-            via = f"{name}（专用代理{reason}）"
-            log(f"⚠️ 专用代理{reason}，已自动改用{name}")
-        log(f"{name}可用，出口 IP: {mask(ip, 3)}")
-        yield {"url": url, "via": via, "key": url}
-        reason = "被拦截"  # 调用方回来继续取下一个，说明刚才这个出口被 Cloudflare 拦截了
+            log("❌ 账号节点连不通，已取消（不会直连）")
+            info["note"] = "账号节点不可用，已取消"
+            return None
+        log(f"账号节点可用，出口 IP: {mask(ip, 3)}")
+        return {"url": url, "via": "账号节点", "key": key}
 
-    info["note"] = "跳过（出口 IP 已被拦截）" if skipped_blocked else "代理全部失效，已取消"
+    if PROXY:
+        if PROXY in blocked_keys:
+            log("⏭ 跳过：全局代理出口已被 Cloudflare 拦截，继续尝试只会更糟")
+            info["note"] = "跳过（出口 IP 已被拦截）"
+            return None
+        ip = check_proxy(p, PROXY)
+        if not ip:
+            log("❌ 全局代理不可用，且该账号未配置自己的节点，已取消（不会直连）")
+            info["note"] = "全局代理失效且无账号节点，已取消"
+            return None
+        log(f"全局代理可用，出口 IP: {mask(ip, 3)}")
+        return {"url": PROXY, "via": "全局代理", "key": PROXY}
+
+    if GLOBAL_PROXY_FAILED:
+        log("❌ 全局代理不可用，且该账号未配置自己的节点，已取消（不会直连）")
+        info["note"] = "全局代理失效且无账号节点，已取消"
+        return None
+    if "(direct)" in blocked_keys:
+        log("⏭ 跳过：直连出口已被 Cloudflare 拦截，继续尝试只会更糟")
+        info["note"] = "跳过（出口 IP 已被拦截）"
+        return None
+    return {"url": None, "via": "直连", "key": "(direct)"}
 
 
 # ───────────────────────── Telegram 推送 ─────────────────────────
@@ -602,9 +642,9 @@ def main():
         tg_send("❌ <b>NeoHeberg 续期</b>：没有可用的账号配置\n" + "\n".join(html.escape(e) for e in errors))
         return 1
 
-    # 让 Actions 日志屏蔽账号和密码（防止公开仓库泄露）
+    # 让 Actions 日志屏蔽账号、密码和节点链接（防止公开仓库泄露）
     for a in accounts:
-        for v in (a["password"], a["user"]):
+        for v in (a["password"], a["user"], a["node"]):
             if len(v) >= 4 and "\n" not in v:
                 print(f"::add-mask::{v}", flush=True)
 
@@ -612,38 +652,31 @@ def main():
     log(f"共 {total} 个账号，续期阈值默认 {RENEW_DAYS} 天" + ("，强制续期" if FORCE_RENEW else ""))
     results, blocked_keys, ran = [], set(), False
 
-    with sync_playwright() as p:
-        for i, acc in enumerate(accounts, 1):
-            LABEL = acc["name"] if total > 1 else ""
-            FILE_TAG = f"acc{i}_" if total > 1 else ""
+    try:
+        with sync_playwright() as p:
+            for i, acc in enumerate(accounts, 1):
+                LABEL = acc["name"] if total > 1 else ""
+                FILE_TAG = f"acc{i}_" if total > 1 else ""
 
-            info, final, last_blocked, tried = {}, None, None, 0
-            for choice in iter_choices(p, acc, blocked_keys, info):
-                if tried:
-                    time.sleep(5)  # 同一账号换出口重试前稍等
-                elif ran:  # 账号之间留间隔，避免触发站点限流
-                    gap = ACCOUNT_GAP + random.uniform(0, 15)
-                    log(f"等待 {gap:.0f}s 后处理下一个账号 …")
-                    time.sleep(gap)
-                ran, tried = True, tried + 1
-
-                if tried == 1:
-                    log(f"开始处理（{i}/{total}）：账号={mask(acc['user'])}（{len(acc['user'])}位） "
-                        f"密码={len(acc['password'])}位 实例={mask(acc['vmid'])}")
-                res = process_account(p, acc, choice)
-                if res["blocked"]:  # 被 Cloudflare 拦截：记下这个出口，尝试下一个
-                    blocked_keys.add(choice["key"])
-                    last_blocked = res
-                    continue
-                final = res
-                break
-
-            if final is None:
-                if last_blocked:
-                    final = dict(last_blocked, note="被 Cloudflare 拦截" + ("（所有出口均被拦截）" if tried > 1 else ""))
+                log(f"开始处理（{i}/{total}）：账号={mask(acc['user'])}（{len(acc['user'])}位） "
+                    f"密码={len(acc['password'])}位 实例={mask(acc['vmid'])}"
+                    + ("  出口=账号节点" if acc["node"] else ""))
+                info = {}
+                choice = resolve_exit(p, acc, blocked_keys, info)
+                if choice is None:
+                    final = {"status": "failed", "note": info.get("note", "代理不可用，已取消"), "via": ""}
                 else:
-                    final = {"status": "failed", "note": info.get("note", "代理全部失效，已取消"), "via": ""}
-            results.append((acc["name"], final["status"], final["note"], final["via"]))
+                    if ran:  # 账号之间留间隔，避免触发站点限流
+                        gap = ACCOUNT_GAP + random.uniform(0, 15)
+                        log(f"等待 {gap:.0f}s …")
+                        time.sleep(gap)
+                    ran = True
+                    final = process_account(p, acc, choice)
+                    if final["blocked"]:  # 被 Cloudflare 拦截：记下这个出口，本次运行内不再撞
+                        blocked_keys.add(choice["key"])
+                results.append((acc["name"], final["status"], final["note"], final["via"]))
+    finally:
+        stop_nodes()
 
     LABEL = ""
     log("═════════ 汇总 ═════════")

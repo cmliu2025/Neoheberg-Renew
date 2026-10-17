@@ -4,7 +4,10 @@
 
 支持: vless / vmess / trojan / ss / hysteria2(hy2) / tuic / socks5 / http
 成功后把 PROXY_SERVER=socks5://127.0.0.1:1080 写入 $GITHUB_ENV，供 renew.py 使用。
-失败时不中断 workflow，而是写入 GLOBAL_PROXY_FAILED=1，由 renew.py 按账号决定是否继续。
+失败时不中断 workflow，而是写入 GLOBAL_PROXY_FAILED=1，由 renew.py 决定哪些账号被取消。
+
+本文件同时是库：renew.py 会 import 它，调用 start_node(link) 为「每个账号自己的节点链接」
+各启动一个独立的 sing-box 实例（随机本地端口），所以账号节点不需要在 workflow 里单独配置。
 
 用法:
   NODE_LINK='vless://...' python setup_proxy.py
@@ -221,21 +224,27 @@ def parse_link(link):
     return PARSERS[scheme](link.strip())
 
 
-def build_config(outbound):
+def build_config(outbound, port=PORT):
     return {
         "log": {"level": "warn"},
-        "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": PORT}],
+        "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": port}],
         "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
         "route": {"final": "proxy"},
     }
 
 
 # ───────────────────────── sing-box 下载 / 启动 ─────────────────────────
+_SB_ERR = []  # 下载失败只试一次，多个账号不重复下载
+
+
 def ensure_singbox():
     """不走 GitHub API（匿名有限流）：跟随 /releases/latest 的重定向拿到版本号，再按文件名直接下载。"""
     binp = os.path.join(WORKDIR, "sing-box")
     if os.path.exists(binp):
         return binp
+    if _SB_ERR:
+        raise RuntimeError(_SB_ERR[0])
+    os.makedirs(WORKDIR, exist_ok=True)
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
         platform.machine().lower(), "amd64")
     ver = os.environ.get("SB_VERSION", "").lstrip("v")
@@ -254,7 +263,8 @@ def ensure_singbox():
         except Exception as e:
             print("  失败:", type(e).__name__, str(e)[:80])
     if data is None:
-        raise RuntimeError(f"无法下载 sing-box v{ver}")
+        _SB_ERR.append(f"无法下载 sing-box v{ver}")
+        raise RuntimeError(_SB_ERR[0])
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         member = next(m for m in tf.getmembers() if m.isfile() and os.path.basename(m.name) == "sing-box")
         with open(binp, "wb") as f:
@@ -263,19 +273,50 @@ def ensure_singbox():
     return binp
 
 
-def wait_port(timeout=20):
+def wait_port(port=PORT, timeout=20, proc=None):
     end = time.time() + timeout
     while time.time() < end:
+        if proc is not None and proc.poll() is not None:  # sing-box 已经退出，不用再等
+            return False
         try:
-            socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
             return True
         except OSError:
             time.sleep(0.5)
     return False
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def start_node(link):
+    """为一条节点链接启动独立的 sing-box（本地随机端口 SOCKS5）。
+    成功返回 (进程, "socks5://127.0.0.1:端口")；失败抛 RuntimeError / ValueError。"""
+    outbound = parse_link(link)
+    binp = ensure_singbox()
+    port = free_port()
+    d = os.path.join(WORKDIR, f"node-{port}")
+    os.makedirs(d, exist_ok=True)
+    cfg_path = os.path.join(d, "config.json")
+    with open(cfg_path, "w") as f:
+        json.dump(build_config(outbound, port), f, indent=2)
+    chk = subprocess.run([binp, "check", "-c", cfg_path], capture_output=True, text=True)
+    if chk.returncode != 0:
+        raise RuntimeError("sing-box 配置校验失败: " + chk.stderr.strip()[:200])
+    logf = open(os.path.join(d, "sing-box.log"), "w")
+    proc = subprocess.Popen([binp, "run", "-c", cfg_path], stdout=logf, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    if not wait_port(port, proc=proc):
+        proc.terminate()
+        raise RuntimeError("sing-box 未能启动")
+    return proc, f"socks5://127.0.0.1:{port}"
+
+
 def mark_failed():
-    """全局代理不可用时留下标记，由 renew.py 决定：有专用代理的账号继续，没有的取消。"""
+    """全局代理不可用时留下标记，由 renew.py 决定：配了自己节点的账号继续，没有的取消。"""
     env_file = os.environ.get("GITHUB_ENV")
     if env_file:
         with open(env_file, "a") as f:
@@ -286,7 +327,7 @@ def mark_failed():
 
 def fail(msg):
     print(f"⚠️ 全局代理不可用: {msg}")
-    print("   后续：配置了专用代理的账号继续登录；未配置专用代理的账号将被取消。")
+    print("   后续：配置了自己节点（node）的账号继续登录；没配的账号将被取消。")
     mark_failed()
     return 0  # 不让整个 workflow 在这里中断
 

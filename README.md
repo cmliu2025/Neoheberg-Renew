@@ -9,7 +9,7 @@
 - 无头浏览器登录（两步式表单 + Cap.js 验证码），读取到期日，剩余天数 ≤ 阈值（默认 14 天）才续期
 - 容器已停止时自动开机
 - **多账号**：每个账号独立浏览器和 cookie，一个失败不影响其他账号
-- **代理**：全局代理（节点链接 / 现成代理）+ 账号专用代理，失效或被 Cloudflare 拦截时自动降级
+- **代理**：每个账号可单独指定一条节点链接（各自启动 sing-box）；没指定的账号用全局代理；任何代理失效都不会悄悄改成直连
 - **Telegram 推送**：每次运行的汇总报告
 - **仓库保活**：每次运行更新 `last_check.txt`，避免 GitHub 60 天无活动后停用定时任务
 - 每周运行一次，也可手动触发
@@ -19,7 +19,7 @@
 ```
 .
 ├── renew.py                      # 主脚本：登录、续期、开机、多账号、代理降级、TG 推送
-├── setup_proxy.py                # 把节点分享链接转成本地 SOCKS5 代理（sing-box）
+├── setup_proxy.py                # 节点分享链接 → 本地 SOCKS5（sing-box）；也被 renew.py 调用为每个账号起实例
 ├── last_check.txt                # 自动生成：上次检测时间（保活用）
 └── .github/workflows/renew.yml   # 定时任务
 ```
@@ -38,7 +38,7 @@
 |---|---|---|
 | `NEO_USER` / `NEO_PASSWORD` / `NEO_VMID` | 单账号必填 | 账号、密码、服务实例 ID（纯数字，不要加引号或前缀） |
 | `NEO_ACCOUNTS` | 多账号必填 | 多账号配置，格式见下文，可与上面三项同时存在 |
-| `NODE_LINK` | 可选 | 全局代理：节点分享链接，经 sing-box 转成本地 SOCKS5 |
+| `NODE_LINK` | 可选 | 全局代理：给没填 `node` 的账号共用，节点分享链接，经 sing-box 转成本地 SOCKS5 |
 | `PROXY_SERVER` | 可选 | 全局代理：现成的代理地址，`NODE_LINK` 优先 |
 | `TG_BOT_TOKEN` / `TG_CHAT_ID` | 可选 | Telegram 推送 |
 
@@ -59,15 +59,15 @@
 ```json
 [
   {"user": "账号1", "password": "密码1", "vmid": "12345"},
-  {"user": "账号2", "password": "密码2", "vmid": "67890", "name": "备用号", "proxy": "http://user:pass@1.2.3.4:8080"}
+  {"user": "账号2", "password": "密码2", "vmid": "67890", "name": "备用号", "node": "vless://uuid@host:443?security=reality&...#节点名"}
 ]
 ```
 
-也可以每行一个 `账号|密码|vmid`（密码里可以含 `|`，`#` 开头为注释）：
+也可以每行一个 `账号|密码|vmid`，需要节点时在末尾再加一段节点链接（密码里可以含 `|`，`#` 开头为注释）：
 
 ```
 账号1|密码1|12345
-账号2|密码2|67890
+账号2|密码2|67890|vless://uuid@host:443?security=tls&...#节点名
 ```
 
 | 字段 | 必填 | 说明 |
@@ -76,7 +76,7 @@
 | `password` | 是 | 密码 |
 | `vmid` | 是 | 服务实例 ID |
 | `name` | 否 | 日志和推送里的别名，默认 `#1`、`#2` |
-| `proxy` | 否 | 该账号专用代理，见下节 |
+| `node` | 否 | 该账号自己的节点链接，见下节。旧字段名 `proxy` 仍然可用（作用相同） |
 | `renew_days` | 否 | 该账号单独的续期阈值 |
 | `type` | 否 | 服务类型，默认 `vps` |
 
@@ -94,25 +94,25 @@ GitHub Actions 的机房 IP 信誉较低，容易被 Cloudflare 的托管质询�
 
 | 方式 | 配置 | 说明 |
 |---|---|---|
-| 全局 · 节点链接 | Secret `NODE_LINK` | 支持 `vless` `vmess` `trojan` `ss` `hysteria2` `tuic` `socks5` `http`，由 sing-box 自动转成 `127.0.0.1:1080` |
-| 全局 · 现成代理 | Secret `PROXY_SERVER` | 如 `http://user:pass@host:port`、`socks5://host:port` |
-| 账号专用 | `NEO_ACCOUNTS` 里的 `proxy` 字段 | 只支持 `http(s)://`、`socks5://` 地址，不支持节点链接 |
+| **账号节点（推荐）** | `NEO_ACCOUNTS` 里的 `node` 字段 | 每个账号一条节点链接，支持 `vless` `vmess` `trojan` `ss` `hysteria2` `tuic` `socks5` `http`。脚本会为每个账号单独启动一个 sing-box（随机本地端口），无需改 workflow |
+| 全局 · 节点链接 | Secret `NODE_LINK` | 给没填 `node` 的账号共用，转成 `127.0.0.1:1080` |
+| 全局 · 现成代理 | Secret `PROXY_SERVER` | 如 `http://user:pass@host:port`、`socks5://host:port`，`NODE_LINK` 优先 |
 
-注意：Chromium 不支持带账号密码的 SOCKS5。有认证的请用 HTTP 代理，或放进全局的 `NODE_LINK`。
+- 多个账号填**同一条**节点链接时，共用一个 sing-box 实例，也共用同一个出口 IP。
+- 想要每个账号一个独立出口 IP，就给每个账号填不同的节点。
+- 节点链接属于敏感信息，请放在 Secrets（`NEO_ACCOUNTS`）里，日志中会自动屏蔽。
 
-### 降级规则（每个账号单独判断，绝不会悄悄改成直连）
+### 规则（每个账号单独判断，绝不会悄悄改成直连）
 
 | 情况 | 结果 |
 |---|---|
-| 没配任何代理 | 直连 |
-| 有专用代理且可用 | 用专用代理 |
-| 专用代理连不上，或被 Cloudflare 拦截 | 自动改用全局代理 |
-| 没有专用代理，全局代理可用 | 用全局代理 |
-| 全局代理失效（含 `NODE_LINK` 启动失败），账号有可用的专用代理 | 该账号继续 |
-| 全局代理失效，账号没有专用代理 | 取消该账号，不直连 |
-| 全局和专用都失效 / 都被拦截 | 取消该账号 |
+| 账号填了 `node`，节点可用 | 只走该节点 |
+| 账号填了 `node`，节点启动失败 / 连不通 / 被 Cloudflare 拦截 | 取消该账号，**不会**换成全局代理或直连 |
+| 没填 `node`，全局代理可用 | 用全局代理 |
+| 没填 `node`，全局代理失效（含 `NODE_LINK` 启动失败） | 取消该账号 |
+| 没填 `node`，也没配全局代理 | 直连 |
 
-另外，某个出口被 Cloudflare 拦截后，本次运行内不再让其他账号去撞这个出口。被取消的账号算失败，整次运行会标红，Telegram 也会通知。
+另外，某个出口被 Cloudflare 拦截后，本次运行内不再让其他共用该出口的账号去撞。被取消的账号算失败，整次运行会标红，Telegram 也会通知。
 
 ## Telegram 推送
 
@@ -152,8 +152,8 @@ run: https://github.com/<用户名>/<仓库>/actions/runs/<编号>
 | `验证码求解超时` | 网络或代理过慢，重跑 |
 | `未取到 CSRF token` | 登录后页面结构异常，查看 Artifacts 里的截图 |
 | `续期失败: …` | 先检查 `NEO_VMID` 是否正确 |
-| `专用代理不可用，已自动改用全局代理` | 专用代理连不上，已降级，请修复它 |
-| `全局代理不可用 … 已取消` | 节点或代理失效，未配专用代理的账号被取消 |
+| `节点启动失败` / `账号节点连不通，已取消` | 该账号的节点链接有误或节点已失效，检查 `node` 字段（日志里会带具体原因） |
+| `全局代理不可用 … 已取消` | 全局代理失效，没填 `node` 的账号被取消 |
 | `Telegram 推送失败: HTTP 401` / `HTTP 400` | 分别是 Token 无效 / Chat ID 无效或没给机器人发过消息 |
 | `push 失败（已忽略）` | 没有开启 Read and write permissions |
 
