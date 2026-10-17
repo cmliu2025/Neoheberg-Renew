@@ -17,7 +17,7 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +49,12 @@ jobs:
 
       - name: Run renew script
         env:
+          # 单账号：沿用 NEO_USER / NEO_PASSWORD / NEO_VMID（原有配置无需改动）
           NEO_USER: ${{ secrets.NEO_USER }}
           NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
           NEO_VMID: ${{ secrets.NEO_VMID }}
+          # 多账号：新增 NEO_ACCOUNTS（JSON 数组或每行 账号|密码|vmid），可与上面三项同时存在
+          NEO_ACCOUNTS: ${{ secrets.NEO_ACCOUNTS }}
           FORCE_RENEW: ${{ inputs.force_renew }}
         run: python renew.py
 
