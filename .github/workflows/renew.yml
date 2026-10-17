@@ -33,13 +33,14 @@ jobs:
       # 代理（二选一，都不配置则直连）：
       #   NODE_LINK    节点分享链接（vless/vmess/trojan/ss/hysteria2/tuic/socks5/http），经 sing-box 转成本地 SOCKS5
       #   PROXY_SERVER 现成的代理地址，如 http://user:pass@host:port 或 socks5://host:port
+      # 全局代理失效不会中断任务：有专用代理的账号继续，没有的账号被取消（见 renew.py 说明）
       - name: Setup proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
           USER_PROXY: ${{ secrets.PROXY_SERVER }}
         run: |
           if [ -n "$NODE_LINK" ]; then
-            python setup_proxy.py
+            python setup_proxy.py || echo "GLOBAL_PROXY_FAILED=1" >> "$GITHUB_ENV"
           elif [ -n "$USER_PROXY" ]; then
             echo "PROXY_SERVER=$USER_PROXY" >> "$GITHUB_ENV"
             echo "使用 PROXY_SERVER secret 提供的代理"
@@ -48,6 +49,7 @@ jobs:
           fi
 
       - name: Run renew script
+        id: renew
         env:
           # 单账号：沿用 NEO_USER / NEO_PASSWORD / NEO_VMID（原有配置无需改动）
           NEO_USER: ${{ secrets.NEO_USER }}
@@ -56,7 +58,27 @@ jobs:
           # 多账号：新增 NEO_ACCOUNTS（JSON 数组或每行 账号|密码|vmid），可与上面三项同时存在
           NEO_ACCOUNTS: ${{ secrets.NEO_ACCOUNTS }}
           FORCE_RENEW: ${{ inputs.force_renew }}
+          # 可选参数（Variables 里设置，留空则用默认值）：RENEW_DAYS 默认 14，ACCOUNT_GAP 默认 30（秒）
+          RENEW_DAYS: ${{ vars.RENEW_DAYS }}
+          ACCOUNT_GAP: ${{ vars.ACCOUNT_GAP }}
+          # Telegram 推送（可选）：Secrets 里设置 TG_BOT_TOKEN / TG_CHAT_ID
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 推送策略（可选）：Variables 里设置 TG_NOTIFY = always(默认) / change / fail
+          TG_NOTIFY: ${{ vars.TG_NOTIFY }}
         run: python renew.py
+
+      # 启动阶段就失败（装依赖出错等）时 renew.py 来不及推送，这里兜底通知一次
+      - name: Notify Telegram (failed before renew)
+        if: failure() && steps.renew.outcome == 'skipped'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+          curl -sS -m 20 -o /dev/null "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=❌ NeoHeberg 续期任务在启动阶段失败：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
 
       - name: Upload debug files
         if: failure()
