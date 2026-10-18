@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-把节点分享链接（NODE_LINK）转成 sing-box 配置，并在本机 127.0.0.1:1080 启动 SOCKS5 代理。
+节点分享链接 → 本地 SOCKS5 代理（基于 sing-box），并整理全局代理。
 
-支持: vless / vmess / trojan / ss / hysteria2(hy2) / tuic / socks5 / http
-成功后把 PROXY_SERVER=socks5://127.0.0.1:1080 写入 $GITHUB_ENV，供 renew.py 使用。
-失败时不中断 workflow，而是写入 GLOBAL_PROXY_FAILED=1，由 renew.py 决定哪些账号被取消。
+支持的节点协议: vless / vmess / trojan / ss / hysteria2(hy2) / tuic / socks5 / http
 
-本文件同时是库：renew.py 会 import 它，调用 start_node(link) 为「每个账号自己的节点链接」
-各启动一个独立的 sing-box 实例（随机本地端口），所以账号节点不需要在 workflow 里单独配置。
+两种用法：
+  ① 命令行（workflow 里的 "Setup proxy" 步骤）：准备"全局代理"
+       NODE_LINK   全局节点链接（只取第一行）→ 本机 127.0.0.1:1080
+       USER_PROXY  现成的全局代理地址（只取第一行）；NODE_LINK 不可用时作为后备
+     成功后把全局代理写入 $GITHUB_ENV 的 PROXY_SERVER；
+     配置了全局代理但都不可用时写入 GLOBAL_PROXY_FAILED=1（不中断 workflow，由 renew.py 决定哪些账号继续）。
+  ② 被 renew.py 调用 start_nodes()：为各账号"专用代理"里的节点链接启动本地入口（端口从 2080 起）
+
+每个节点单独做配置校验和连通性自检，不可用的节点返回 None。
 
 用法:
   NODE_LINK='vless://...' python setup_proxy.py
@@ -224,27 +229,30 @@ def parse_link(link):
     return PARSERS[scheme](link.strip())
 
 
-def build_config(outbound, port=PORT):
+def build_config(outbounds, base_port=PORT):
+    """outbounds: 单个 outbound dict 或列表。第 i 个节点 → 入口 127.0.0.1:(base_port+i) → 出站 proxy{i}。"""
+    if isinstance(outbounds, dict):
+        outbounds = [outbounds]
+    inbounds, obs, rules = [], [], []
+    for i, ob in enumerate(outbounds):
+        obs.append(dict(ob, tag=f"proxy{i}"))
+        inbounds.append({"type": "socks", "tag": f"in{i}", "listen": "127.0.0.1", "listen_port": base_port + i})
+        rules.append({"inbound": [f"in{i}"], "action": "route", "outbound": f"proxy{i}"})
+    obs.append({"type": "direct", "tag": "direct"})
     return {
         "log": {"level": "warn"},
-        "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": port}],
-        "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
-        "route": {"final": "proxy"},
+        "inbounds": inbounds,
+        "outbounds": obs,
+        "route": {"rules": rules, "final": "proxy0"},
     }
 
 
 # ───────────────────────── sing-box 下载 / 启动 ─────────────────────────
-_SB_ERR = []  # 下载失败只试一次，多个账号不重复下载
-
-
 def ensure_singbox():
     """不走 GitHub API（匿名有限流）：跟随 /releases/latest 的重定向拿到版本号，再按文件名直接下载。"""
     binp = os.path.join(WORKDIR, "sing-box")
     if os.path.exists(binp):
         return binp
-    if _SB_ERR:
-        raise RuntimeError(_SB_ERR[0])
-    os.makedirs(WORKDIR, exist_ok=True)
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
         platform.machine().lower(), "amd64")
     ver = os.environ.get("SB_VERSION", "").lstrip("v")
@@ -263,8 +271,7 @@ def ensure_singbox():
         except Exception as e:
             print("  失败:", type(e).__name__, str(e)[:80])
     if data is None:
-        _SB_ERR.append(f"无法下载 sing-box v{ver}")
-        raise RuntimeError(_SB_ERR[0])
+        raise RuntimeError(f"无法下载 sing-box v{ver}")
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         member = next(m for m in tf.getmembers() if m.isfile() and os.path.basename(m.name) == "sing-box")
         with open(binp, "wb") as f:
@@ -273,11 +280,9 @@ def ensure_singbox():
     return binp
 
 
-def wait_port(port=PORT, timeout=20, proc=None):
+def wait_port(port=PORT, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
-        if proc is not None and proc.poll() is not None:  # sing-box 已经退出，不用再等
-            return False
         try:
             socket.create_connection(("127.0.0.1", port), timeout=1).close()
             return True
@@ -286,100 +291,129 @@ def wait_port(port=PORT, timeout=20, proc=None):
     return False
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def split_lines(v):
+    return [ln.strip() for ln in (v or "").replace("\r", "").split("\n")
+            if ln.strip() and not ln.strip().startswith("#")]
 
 
-def start_node(link):
-    """为一条节点链接启动独立的 sing-box（本地随机端口 SOCKS5）。
-    成功返回 (进程, "socks5://127.0.0.1:端口")；失败抛 RuntimeError / ValueError。"""
-    outbound = parse_link(link)
-    binp = ensure_singbox()
-    port = free_port()
-    d = os.path.join(WORKDIR, f"node-{port}")
-    os.makedirs(d, exist_ok=True)
-    cfg_path = os.path.join(d, "config.json")
-    with open(cfg_path, "w") as f:
-        json.dump(build_config(outbound, port), f, indent=2)
-    chk = subprocess.run([binp, "check", "-c", cfg_path], capture_output=True, text=True)
-    if chk.returncode != 0:
-        raise RuntimeError("sing-box 配置校验失败: " + chk.stderr.strip()[:200])
-    logf = open(os.path.join(d, "sing-box.log"), "w")
-    proc = subprocess.Popen([binp, "run", "-c", cfg_path], stdout=logf, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-    if not wait_port(port, proc=proc):
-        proc.terminate()
-        raise RuntimeError("sing-box 未能启动")
-    return proc, f"socks5://127.0.0.1:{port}"
+def write_env(name, value):
+    """写入 $GITHUB_ENV（多行值用 heredoc 语法）；本地运行则打印。"""
+    env_file = os.environ.get("GITHUB_ENV")
+    if not env_file:
+        print(f"export {name}='{value}'")
+        return
+    delim = "EOF_" + base64.b16encode(os.urandom(6)).decode()
+    with open(env_file, "a") as f:
+        f.write(f"{name}<<{delim}\n{value}\n{delim}\n")
 
 
 def mark_failed():
-    """全局代理不可用时留下标记，由 renew.py 决定：配了自己节点的账号继续，没有的取消。"""
-    env_file = os.environ.get("GITHUB_ENV")
-    if env_file:
-        with open(env_file, "a") as f:
-            f.write("GLOBAL_PROXY_FAILED=1\n")
-    else:
-        print("export GLOBAL_PROXY_FAILED=1")
+    """配置了代理但一个都不可用：留下标记，由 renew.py 取消相关账号（不会直连）。"""
+    write_env("GLOBAL_PROXY_FAILED", "1")
 
 
-def fail(msg):
-    print(f"⚠️ 全局代理不可用: {msg}")
-    print("   后续：配置了自己节点（node）的账号继续登录；没配的账号将被取消。")
-    mark_failed()
-    return 0  # 不让整个 workflow 在这里中断
+def probe(port):
+    """经本地入口访问外网，返回出口 IP；失败返回 None。"""
+    r = subprocess.run(["curl", "-sS", "--max-time", "25", "--socks5-hostname",
+                        f"127.0.0.1:{port}", "https://api.ipify.org"], capture_output=True, text=True)
+    ip = r.stdout.strip()
+    return ip if r.returncode == 0 and re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip) else None
 
 
-def main():
-    link = os.environ.get("NODE_LINK", "").strip()
-    if not link:
-        print("未设置 NODE_LINK")
-        return 1
-    try:
-        outbound = parse_link(link)
-    except Exception as e:
-        return fail(f"节点链接解析失败: {type(e).__name__}: {e}")
-    print(f"节点: {outbound['type']} @ {mask(outbound['server'], 3)}:{outbound['server_port']}")
+def start_nodes(node_lines, base_port=PORT, tag="", label="节点"):
+    """解析、校验并启动一批节点（单个 sing-box 进程，每个节点一个本地入口 base_port+j）。
+
+    返回与 node_lines 等长的列表：可用节点为本地代理地址（socks5://127.0.0.1:端口），不可用为 None。
+    任何环节失败都只影响对应节点，日志里不会出现节点的完整地址。
+    """
+    result = [None] * len(node_lines)
+    parsed = []  # (序号, outbound)
+    for i, link in enumerate(node_lines):
+        try:
+            ob = parse_link(link)
+            parsed.append((i, ob))
+            print(f"{label}#{i + 1}: {ob['type']} @ {mask(ob['server'], 3)}:{ob['server_port']}")
+        except Exception as e:
+            print(f"⚠️ {label}#{i + 1} 解析失败，已忽略: {type(e).__name__}: {e}")
+    if not parsed:
+        return result
 
     os.makedirs(WORKDIR, exist_ok=True)
-    cfg_path = os.path.join(WORKDIR, "config.json")
-    with open(cfg_path, "w") as f:
-        json.dump(build_config(outbound), f, indent=2)
+    cfg_path = os.path.join(WORKDIR, f"config{tag}.json")
     if "--config-only" in sys.argv:
+        with open(cfg_path, "w") as f:
+            json.dump(build_config([ob for _, ob in parsed], base_port), f, indent=2)
         print("配置已生成:", cfg_path)
-        return 0
+        return result
 
     try:
         binp = ensure_singbox()
     except Exception as e:
-        return fail(f"sing-box 下载失败: {type(e).__name__}: {str(e)[:100]}")
-    chk = subprocess.run([binp, "check", "-c", cfg_path], capture_output=True, text=True)
-    if chk.returncode != 0:
-        return fail("sing-box 配置校验失败: " + chk.stderr.strip()[:200])
+        print(f"⚠️ sing-box 下载失败: {type(e).__name__}: {str(e)[:100]}")
+        return result
 
-    logf = open(os.path.join(WORKDIR, "sing-box.log"), "w")
+    # 每个节点先单独校验配置，坏节点不会拖累其他节点
+    valid = []
+    for i, ob in parsed:
+        one = os.path.join(WORKDIR, f"check{tag}{i}.json")
+        with open(one, "w") as f:
+            json.dump(build_config([ob], base_port), f)
+        chk = subprocess.run([binp, "check", "-c", one], capture_output=True, text=True)
+        if chk.returncode == 0:
+            valid.append((i, ob))
+        else:
+            print(f"⚠️ {label}#{i + 1} 配置校验失败，已忽略: {chk.stderr.strip()[:150]}")
+    if not valid:
+        return result
+
+    with open(cfg_path, "w") as f:
+        json.dump(build_config([ob for _, ob in valid], base_port), f, indent=2)
+    logf = open(os.path.join(WORKDIR, f"sing-box{tag}.log"), "w")
     subprocess.Popen([binp, "run", "-c", cfg_path], stdout=logf, stderr=subprocess.STDOUT,
                      start_new_session=True)
-    if not wait_port():
-        return fail("sing-box 未能启动")
+    if not wait_port(base_port):
+        print("⚠️ sing-box 未能启动")
+        return result
 
-    # 连通性自检：经代理访问外网，确认节点可用
-    r = subprocess.run(["curl", "-sS", "--max-time", "25", "--socks5-hostname",
-                        f"127.0.0.1:{PORT}", "https://api.ipify.org"], capture_output=True, text=True)
-    ip = r.stdout.strip()
-    if r.returncode != 0 or not ip:
-        return fail("节点连通性检查失败: " + r.stderr.strip()[:150])
-    print(f"✅ 代理可用，出口 IP: {mask(ip, 3)}")
+    for j, (i, ob) in enumerate(valid):
+        ip = probe(base_port + j)
+        if ip:
+            print(f"✅ {label}#{i + 1} 可用，出口 IP: {mask(ip, 3)}")
+            result[i] = f"socks5://127.0.0.1:{base_port + j}"
+        else:
+            print(f"⚠️ {label}#{i + 1} 连通性检查失败，不可用")
+    return result
 
-    proxy = f"socks5://127.0.0.1:{PORT}"
-    env_file = os.environ.get("GITHUB_ENV")
-    if env_file:
-        with open(env_file, "a") as f:
-            f.write(f"PROXY_SERVER={proxy}\n")
-    else:
-        print(f"export PROXY_SERVER={proxy}")
+
+def main():
+    node_lines = split_lines(os.environ.get("NODE_LINK", ""))
+    user_proxies = split_lines(os.environ.get("USER_PROXY", ""))
+    if not node_lines and not user_proxies:
+        print("未配置全局代理")
+        return 0
+    if len(node_lines) > 1:
+        print(f"ℹ️ NODE_LINK 只取第一行作为全局代理（共 {len(node_lines)} 行）。账号需要各自的节点请写在 NEO_ACCOUNTS 的 proxy 字段里。")
+    if len(user_proxies) > 1:
+        print(f"ℹ️ PROXY_SERVER 只取第一行作为全局代理（共 {len(user_proxies)} 行）。")
+
+    proxy = None
+    if node_lines:
+        proxy = start_nodes(node_lines[:1], label="全局节点")[0]
+        if "--config-only" in sys.argv:
+            return 0
+        if not proxy and user_proxies:
+            print("⚠️ 全局节点不可用，改用 PROXY_SERVER 作为全局代理")
+    if not proxy and user_proxies:
+        proxy = user_proxies[0]
+
+    if not proxy:
+        print("⚠️ 配置了全局代理但不可用。")
+        print("   后续：配置了专用代理的账号继续登录；未配置专用代理的账号将被取消（不会直连）。")
+        mark_failed()
+        return 0  # 不让整个 workflow 在这里中断
+
+    write_env("PROXY_SERVER", proxy)
+    print("全局代理已就绪")
     return 0
 
 
