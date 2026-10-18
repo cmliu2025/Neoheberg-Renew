@@ -370,16 +370,60 @@ def panel_info(page):
 
 
 def do_renew(page, csrf, acc):
+    """提交续期请求。返回 (hint, msg)。
+
+    hint 是站点明确给出的成败（True/False），无法判断时为 None。只有响应本身是 JSON 时才采信其中的
+    success/message；如果响应是整页 HTML（续期后重定向回面板），页面脚本里的 "message" 多是无关的模板文案
+    （例如 "La console de ce VPS n'a pas pu être chargée."），绝不能当成续期结果。
+    """
     r = panel_fetch(page, "/services/renew", {"csrf_token": csrf, "type": acc["type"], "id": acc["vmid"]})
-    body = r["text"]
-    m = re.search(r'"message"\s*:\s*"([^"]*)"', body)
-    msg = ""
-    if m:
-        try:
-            msg = json.loads('"' + m.group(1) + '"')
-        except Exception:
-            msg = m.group(1)
-    return ("renouvel" in msg.lower()), (msg or f"HTTP {r['status']}")
+    hint, msg = None, ""
+    try:
+        d = json.loads(r["text"])
+    except ValueError:
+        d = None
+    if isinstance(d, dict):
+        msg = str(d.get("message") or d.get("error") or "")
+        if isinstance(d.get("success"), bool):
+            hint = d["success"]
+        elif "renouvel" in msg.lower():
+            hint = True
+    if r["status"] >= 400:
+        hint = False
+    return hint, (msg or f"HTTP {r['status']}")
+
+
+def parse_date(s):
+    """dd/mm/yyyy（面板用的法式日期）→ date，解析失败返回 None。"""
+    try:
+        return datetime.strptime(s or "", "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def renewal_outcome(exp, days, exp2, days2, hint, msg):
+    """判断续期是否成功，返回 (ok, 说明)。
+
+    以面板上到期日是否真的延长为准——站点返回的提示文案不可靠（见 do_renew）。
+    只有读不到到期日/剩余天数、无法比较时，才参考站点明确给出的 hint。
+    """
+    d1, d2 = parse_date(exp), parse_date(exp2)
+    if d1 and d2:
+        extended = d2 > d1
+    elif days is not None and days2 is not None:
+        extended = days2 > days
+    else:
+        extended = None
+
+    if extended is True:
+        if days is not None and days2 is not None:
+            return True, f"续期成功（剩余 {days} → {days2} 天）"
+        return True, f"续期成功（到期日 {exp} → {exp2}）"
+    if extended is False:
+        return False, f"续期未生效（到期日仍为 {exp2}）：{msg}"
+    if hint is True:
+        return True, "续期成功（站点已确认，但未能读取新的到期日）"
+    return False, f"续期结果无法确认：{msg}"
 
 
 def keep_running(page, csrf, acc):
@@ -604,14 +648,13 @@ def process_account(p, acc, choice):
             if FORCE_RENEW or days is None or days <= threshold:
                 if FORCE_RENEW:
                     log("已指定强制续期")
-                ok, msg = do_renew(page, csrf, acc)
-                log(f"续期{'成功' if ok else '失败'}: {msg}")
+                hint, msg = do_renew(page, csrf, acc)
                 _, exp2, days2 = panel_info(page)
                 log(f"续期后到期日: {exp2}  剩余: {days2} 天")
+                ok, note = renewal_outcome(exp, days, exp2, days2, hint, msg)
+                log(("✅ " if ok else "❌ ") + note)
                 keep_running(page, csrf, acc)
-                if ok:
-                    return result("renewed", f"续期成功（剩余 {days} → {days2} 天）")
-                return result("failed", f"续期失败: {msg}")
+                return result("renewed" if ok else "failed", note)
 
             log(f"剩余天数 > {threshold}，本次无需续期")
             keep_running(page, csrf, acc)
