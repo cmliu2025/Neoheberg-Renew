@@ -26,7 +26,7 @@
 
 ## 快速开始
 
-1. 新建一个仓库（**建议私有**，把 `renew.py`、`setup_proxy.py`、`.github/workflows/renew.yml` 放进去。
+1. 新建一个仓库，把 `renew.py`、`setup_proxy.py`、`.github/workflows/renew.yml` 放进去。
 2. 进入 **Settings → Actions → General → Workflow permissions**，选择 **Read and write permissions**（保活要往仓库提交文件）。
 3. 进入 **Settings → Secrets and variables → Actions**，添加 Secrets（见下表，最少需要账号信息）。
 4. 打开 **Actions** 页面，选择 `Neoheberg Renew` → **Run workflow**，手动运行一次。
