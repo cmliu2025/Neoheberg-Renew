@@ -30,26 +30,16 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      # 代理：
-      #   【账号节点】在 NEO_ACCOUNTS 里给每个账号填 node 字段（节点分享链接），
-      #               renew.py 会为每个账号自动启动各自的 sing-box，这里不需要任何配置。
-      #   【全局代理】给没填 node 的账号共用（可不配），二选一：
-      #     NODE_LINK    节点分享链接，经 sing-box 转成本地 SOCKS5
-      #     PROXY_SERVER 现成的代理地址，如 http://user:pass@host:port 或 socks5://host:port
-      # 账号的节点失效 → 该账号被取消（不会直连、不会换出口）；全局代理失效 → 没填 node 的账号被取消
+      # 全局代理（都不配置则直连；账号专用代理写在 NEO_ACCOUNTS 的 proxy 字段里）：
+      #   NODE_LINK    节点分享链接（vless/vmess/trojan/ss/hysteria2/tuic/socks5/http），经 sing-box 转成本地 SOCKS5
+      #   PROXY_SERVER 现成的代理地址，如 http://user:pass@host:port 或 socks5://host:port
+      # 两者都配时 NODE_LINK 优先，不可用时改用 PROXY_SERVER。
+      # 全局代理失效不会中断任务：有可用专用代理的账号继续，没有的账号被取消（见 renew.py 说明）
       - name: Setup global proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
           USER_PROXY: ${{ secrets.PROXY_SERVER }}
-        run: |
-          if [ -n "$NODE_LINK" ]; then
-            python setup_proxy.py || echo "GLOBAL_PROXY_FAILED=1" >> "$GITHUB_ENV"
-          elif [ -n "$USER_PROXY" ]; then
-            echo "PROXY_SERVER=$USER_PROXY" >> "$GITHUB_ENV"
-            echo "使用 PROXY_SERVER secret 提供的全局代理"
-          else
-            echo "未配置全局代理：填了 node 的账号走各自节点，其余账号直连"
-          fi
+        run: python setup_proxy.py || echo "GLOBAL_PROXY_FAILED=1" >> "$GITHUB_ENV"
 
       - name: Run renew script
         id: renew
@@ -58,7 +48,7 @@ jobs:
           NEO_USER: ${{ secrets.NEO_USER }}
           NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
           NEO_VMID: ${{ secrets.NEO_VMID }}
-          # 多账号：新增 NEO_ACCOUNTS（JSON 数组或每行 账号|密码|vmid[|节点链接]），可与上面三项同时存在
+          # 多账号：新增 NEO_ACCOUNTS（JSON 数组或每行 账号|密码|vmid），可与上面三项同时存在
           NEO_ACCOUNTS: ${{ secrets.NEO_ACCOUNTS }}
           FORCE_RENEW: ${{ inputs.force_renew }}
           # 可选参数（Variables 里设置，留空则用默认值）：RENEW_DAYS 默认 14，ACCOUNT_GAP 默认 30（秒）
