@@ -1,52 +1,38 @@
 #!/usr/bin/env python3
 """
-NeoHeberg 自动续期 + 开机守护（GitHub Actions，支持多账号）
+NeoHeberg 自动续期 + 服务器状态检查与开机守护（GitHub Actions，单账号单代理）
 
-流程（每个账号独立）：无头浏览器登录（两步式表单 + Cap.js）→ 读取到期日
-      → 剩余天数 <= RENEW_DAYS 则续期 → 容器若已停止则开机。
+流程：无头浏览器登录（两步式表单 + Cap.js）→ 读取到期日
+      · 续期模式（默认）：剩余天数 <= RENEW_DAYS 则续期，随后检查容器状态，已停止则开机
+      · 状态检查模式（MODE=status 或命令行 --status）：只检查容器状态，已停止则自动开机并确认，不续期
 
-账号配置（二选一）：
-  ① 多账号：Secret NEO_ACCOUNTS
-     JSON（推荐，密码里有任何特殊字符都安全）：
-       [
-         {"user": "账号1", "password": "密码1", "vmid": "12345"},
-         {"user": "账号2", "password": "密码2", "vmid": "67890", "proxy": "vless://uuid@host:443?...#节点"}
-       ]
-     可选字段: name(日志里的别名) / type(默认 vps) / renew_days / proxy(该账号专用代理)
-     proxy 支持两种写法：
-       · 节点分享链接：vless:// vmess:// trojan:// ss:// hysteria2:// hy2:// tuic://（经 sing-box 转成本地代理）
-       · 代理地址：http://[user:pass@]host:port、socks5://host:port（带账号密码的 socks5:// 会走 sing-box）
-     或每行一个（密码可含 | 以外的任意字符，# 开头为注释；这种格式不能配置专用代理）：
-       账号1|密码1|12345
-       账号2|密码2|67890
-  ② 单账号（兼容旧配置）：NEO_USER / NEO_PASSWORD / NEO_VMID
-  两种可同时存在：旧的单账号变量会作为第一个账号，与 NEO_ACCOUNTS 合并处理（相同账号+实例自动去重）。
+必填环境变量（在仓库 Secrets 里配置）：
+  NEO_USER      账号（邮箱或用户名）
+  NEO_PASSWORD  密码
+  NEO_VMID      服务实例 ID（纯数字）
 
-其他环境变量：
+可选环境变量：
   NEO_TYPE      服务类型，默认 vps
   RENEW_DAYS    剩余多少天时续期，默认 14
-  PROXY_SERVER  全局代理（单个），如 socks5://127.0.0.1:1080；
-                workflow 里配置 NODE_LINK / PROXY_SERVER 时由 setup_proxy.py 准备
   FORCE_RENEW   设为 true 则忽略剩余天数，强制续期
-  ACCOUNT_GAP   账号之间的间隔秒数（另加 0~15 秒随机），默认 30
+  MODE          设为 status 进入状态检查模式
+  START_WAIT    下发开机指令后最多等多少秒确认容器运行起来，默认 90
+  LOGIN_ATTEMPTS 登录失败时最多尝试几次，默认 3（账号密码错误或被 Cloudflare 拦截时不重试）
+  PROXY_SERVER  代理地址，如 socks5://127.0.0.1:1080 或 http://user:pass@host:port
+                （workflow 里配置 NODE_LINK / PROXY_SERVER 时由 setup_proxy.py 准备）
 
-代理降级规则（每个账号独立判断，不可用的代理绝不会悄悄改成直连）：
-  · 有专用代理 → 先用专用代理；连不上、节点启动失败或出口被 Cloudflare 拦截，则自动改用全局代理
-  · 没有专用代理 → 用全局代理；全局代理失效则该账号被取消
-  · 全局代理（含 NODE_LINK 启动失败）与专用代理都失效/被拦截 → 该账号被取消；所有账号都被取消则整体失败退出
-  · 全局代理失效时，配置了可用专用代理的账号照常继续
-  · 某个出口被 Cloudflare 拦截后，本次运行内不再让其他账号去撞这个出口
-  · 一个代理都没配置 → 直连
+代理规则（不可用的代理绝不会悄悄改成直连）：
+  · 配置了代理：先确认它可用；不可用（或 NODE_LINK 启动失败）则本次取消
+  · 没有配置代理：直连
 
 Telegram 推送（可选）：
   TG_BOT_TOKEN  机器人 Token（@BotFather 创建）
   TG_CHAT_ID    接收消息的 Chat ID
-  TG_NOTIFY     always(默认,每次都发) / change(有续期或失败或代理降级才发) / fail(仅失败才发)
+  TG_NOTIFY     always(默认,每次都发) / change(续期或自动开机或失败才发) / fail(仅失败才发)
 """
 import html
 import json
 import os
-import random
 import re
 import sys
 import time
@@ -60,127 +46,53 @@ BASE = "https://dash.neoheberg.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-DEFAULT_TYPE = (os.environ.get("NEO_TYPE") or "vps").strip()
+USER = os.environ.get("NEO_USER", "").strip()
+PASSWORD = os.environ.get("NEO_PASSWORD", "").strip()
+VMID = os.environ.get("NEO_VMID", "").strip()
+TYPE = (os.environ.get("NEO_TYPE") or "vps").strip()
 RENEW_DAYS = int(os.environ.get("RENEW_DAYS") or 14)
 FORCE_RENEW = os.environ.get("FORCE_RENEW", "").lower() in ("1", "true", "yes")
-# 全局代理（单个，取第一个非空非注释行）
+STATUS_ONLY = os.environ.get("MODE", "").strip().lower() == "status" or "--status" in sys.argv
+START_WAIT = int(os.environ.get("START_WAIT") or 90)
+ATTEMPTS = int(os.environ.get("LOGIN_ATTEMPTS") or 3)
+BACKOFF = [15, 60, 180]  # 登录失败后的等待秒数（站点有 429 速率限制）
+
+# 代理（单个，取第一个非空非注释行）
 PROXY = next((ln.strip() for ln in os.environ.get("PROXY_SERVER", "").replace("\r", "").split("\n")
               if ln.strip() and not ln.strip().startswith("#")), "")
-# setup_proxy.py 在 NODE_LINK 启动失败时写入；表示"配置了全局代理但它不可用"
-GLOBAL_PROXY_FAILED = os.environ.get("GLOBAL_PROXY_FAILED", "").lower() in ("1", "true", "yes")
+# setup_proxy.py 在 NODE_LINK 启动失败时写入；表示"配置了代理但它不可用"
+PROXY_FAILED = (os.environ.get("PROXY_FAILED") or os.environ.get("GLOBAL_PROXY_FAILED") or "").lower() in ("1", "true", "yes")
+
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT = os.environ.get("TG_CHAT_ID", "").strip()
 TG_NOTIFY = (os.environ.get("TG_NOTIFY", "") or "always").strip().lower()  # always / change / fail
-ATTEMPTS = int(os.environ.get("LOGIN_ATTEMPTS") or 3)
-ACCOUNT_GAP = int(os.environ.get("ACCOUNT_GAP") or 30)
-BACKOFF = [15, 60, 180]  # 登录失败后的等待秒数（站点有 429 速率限制）
 
-LABEL = ""      # 当前账号标签，用于日志前缀
-FILE_TAG = ""   # 当前账号的调试文件前缀（多账号时区分截图）
+ACC = {"user": USER, "password": PASSWORD, "vmid": VMID, "type": TYPE}  # 供下面的面板函数使用
 
 
 def log(msg):
-    prefix = f"[{LABEL}] " if LABEL else ""
-    print(f"[{time.strftime('%H:%M:%S')}] {prefix}{msg}", flush=True)
-
-
-def mask(s, show=2):
-    s = str(s)
-    return s if len(s) <= show * 2 else s[:show] + "*" * (len(s) - show * 2) + s[-show:]
-
-
-# ───────────────────────── 账号配置 ─────────────────────────
-def _norm(entry, idx):
-    """把一条账号配置规范化；返回 (账号dict, 错误信息)。"""
-    g = lambda *keys: next((str(entry[k]).strip() for k in keys if entry.get(k) not in (None, "")), "")
-    acc = {
-        "user": g("user", "username", "email", "identifier"),
-        "password": g("password", "pass", "pwd"),
-        "vmid": g("vmid", "id"),
-        "type": g("type") or DEFAULT_TYPE,
-        "proxy": g("proxy"),
-        "name": g("name", "label") or f"#{idx}",
-    }
-    rd = g("renew_days")
-    acc["renew_days"] = int(rd) if rd.isdigit() else RENEW_DAYS
-    missing = [k for k in ("user", "password", "vmid") if not acc[k]]
-    return acc, (f"第 {idx} 个账号缺少字段: {', '.join(missing)}" if missing else "")
-
-
-def parse_accounts():
-    """返回 (账号列表, 错误列表)。
-    来源：旧的单账号变量 NEO_USER/NEO_PASSWORD/NEO_VMID（若设置，作为第一个账号）
-          + NEO_ACCOUNTS（JSON 或每行一个）。相同的 账号+实例 自动去重。"""
-    entries = []
-    if os.environ.get("NEO_USER") or os.environ.get("NEO_PASSWORD") or os.environ.get("NEO_VMID"):
-        entries.append({"user": os.environ.get("NEO_USER", ""), "password": os.environ.get("NEO_PASSWORD", ""),
-                        "vmid": os.environ.get("NEO_VMID", "")})
-
-    raw = os.environ.get("NEO_ACCOUNTS", "").strip()
-    if raw:
-        if raw.startswith("["):
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as e:
-                return [], [f"NEO_ACCOUNTS 不是合法 JSON（第 {e.lineno} 行第 {e.colno} 列附近）"]
-            if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
-                return [], ["NEO_ACCOUNTS 应为对象数组 [{...}, {...}]"]
-            entries += data
-        else:
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("|")
-                if len(parts) < 3:
-                    entries.append({})  # 占位，让后面报"缺少字段"
-                    continue
-                # 账号取第一段、vmid 取最后一段，中间都算密码（密码里可以有 |）
-                entries.append({"user": parts[0], "password": "|".join(parts[1:-1]), "vmid": parts[-1]})
-
-    accounts, errors, seen = [], [], set()
-    for i, e in enumerate(entries, 1):
-        acc, err = _norm(e, i)
-        if err:
-            errors.append(err)
-            continue
-        key = (acc["user"], acc["vmid"])
-        if key in seen:
-            errors.append(f"第 {i} 个账号与前面重复（相同账号+实例），已忽略")
-            continue
-        seen.add(key)
-        accounts.append(acc)
-    if not entries:
-        errors.append("未配置账号：请设置 NEO_ACCOUNTS，或 NEO_USER / NEO_PASSWORD / NEO_VMID")
-    return accounts, errors
-
-
-def build_proxy(url):
-    """代理 URL -> Playwright proxy 参数。支持 http/https/socks5，可带账号密码。"""
-    if not url:
-        return None
-    u = urlparse(url)
-    scheme = {"socks5h": "socks5"}.get(u.scheme, u.scheme)
-    if scheme not in ("http", "https", "socks5", "socks4") or not u.hostname or not u.port:
-        raise ValueError("代理格式应为 scheme://[user:pass@]host:port（http/https/socks5）")
-    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
-    proxy = {"server": f"{scheme}://{host}:{u.port}"}
-    if u.username:
-        if scheme.startswith("socks"):
-            log("⚠️ Chromium 不支持带账号密码的 SOCKS5，请改用 NODE_LINK（sing-box）或 HTTP 代理")
-        proxy["username"] = unquote(u.username)
-        proxy["password"] = unquote(u.password or "")
-    return proxy
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def snap(page, name):
     """失败时保存截图 + HTML，供 Actions artifacts 下载排查。"""
     try:
-        page.screenshot(path=f"{FILE_TAG}{name}.png", full_page=True)
-        with open(f"{FILE_TAG}{name}.html", "w", encoding="utf-8") as f:
+        page.screenshot(path=f"{name}.png", full_page=True)
+        with open(f"{name}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
     except Exception:
         pass
+
+
+# ───────────────────────── 登录 ─────────────────────────
+BLOCKED = "blocked"      # 被 Cloudflare 托管质询拦截
+BADCREDS = "badcreds"    # 站点提示账号或密码无效
+FAILED = "failed"        # 其他失败
+
+
+def mask(s, show=2):
+    s = str(s)
+    return s if len(s) <= show * 2 else s[:show] + "*" * (len(s) - show * 2) + s[-show:]
 
 
 def read_csrf(page):
@@ -195,12 +107,6 @@ def read_csrf(page):
         }""") or ""
     except Exception:
         return ""
-
-
-# ───────────────────────── 登录 ─────────────────────────
-BLOCKED = "blocked"      # 被 Cloudflare 托管质询拦截
-BADCREDS = "badcreds"    # 站点提示账号或密码无效
-FAILED = "failed"        # 其他失败
 
 
 def cf_blocked(page):
@@ -426,36 +332,120 @@ def renewal_outcome(exp, days, exp2, days2, hint, msg):
     return False, f"续期结果无法确认：{msg}"
 
 
-def keep_running(page, csrf, acc):
-    """容器已停止则开机；失败不影响续期结果。"""
+# ───────────────────────── 容器状态检查与开机 ─────────────────────────
+RUNNING_STATES = {"running", "started", "online", "on", "up"}
+STOPPED_STATES = {"stopped", "halted", "shutdown", "shutoff", "off", "offline", "dead", "poweroff"}
+
+
+def get_vps_status(page, acc):
+    """查询容器状态，返回小写状态字符串（如 running / stopped）。失败抛异常。"""
+    r = panel_fetch(page, f"/app/services/vps-stats.php?id={acc['vmid']}", ajax=True)
+    if r["status"] >= 400:
+        raise RuntimeError(f"HTTP {r['status']}")
+    st = json.loads(r["text"])
+    if not isinstance(st, dict):
+        raise ValueError("响应不是 JSON 对象")
+    return str(st.get("status") or st.get("state") or "unknown").strip().lower()
+
+
+def ensure_running(page, csrf, acc):
+    """检查容器状态，已停止则开机并等待确认。返回 (state, detail)：
+
+      running       本来就在运行
+      started       已停止 → 已自动开机，并确认运行起来
+      start_failed  已停止，开机失败（请求被拒 / 超时仍未运行）
+      unknown       状态不在已知的"运行/停止"范围内（如 paused），不自动处理
+      error         查询状态本身失败（接口变了/网络问题）
+    """
     try:
-        st = json.loads(panel_fetch(page, f"/app/services/vps-stats.php?id={acc['vmid']}", ajax=True)["text"])
-        status = (st.get("status") or "unknown").lower()
-        log(f"容器状态: {status}")
-        if status in ("stopped", "halted", "shutdown"):
-            r = panel_fetch(page, "/app/services/vps-power.php",
-                            {"vmid": acc["vmid"], "signal": "start", "csrf_token": csrf}, ajax=True)
-            log(f"已下发开机指令: HTTP {r['status']}")
+        status = get_vps_status(page, acc)
     except Exception as e:
-        log(f"状态/开机检查跳过: {type(e).__name__}: {str(e)[:100]}")
+        log(f"⚠️ 查询容器状态失败: {type(e).__name__}: {str(e)[:100]}")
+        return "error", f"{type(e).__name__}"
+    log(f"容器状态: {status}")
+    if status in RUNNING_STATES:
+        return "running", status
+    if status not in STOPPED_STATES:
+        log(f"⚠️ 容器状态「{status}」不是已知的运行/停止状态，不自动处理")
+        return "unknown", status
+
+    log("⚠️ 容器已停止，正在开机 …")
+    try:
+        r = panel_fetch(page, "/app/services/vps-power.php",
+                        {"vmid": acc["vmid"], "signal": "start", "csrf_token": csrf}, ajax=True)
+    except Exception as e:
+        log(f"❌ 开机请求异常: {type(e).__name__}: {str(e)[:100]}")
+        return "start_failed", f"请求异常 {type(e).__name__}"
+    if r["status"] >= 400:
+        log(f"❌ 开机请求被拒绝: HTTP {r['status']}")
+        return "start_failed", f"开机请求 HTTP {r['status']}"
+    log(f"已下发开机指令: HTTP {r['status']}，等待容器启动 …")
+
+    last = status
+    for _ in range(max(1, START_WAIT // 5)):
+        page.wait_for_timeout(5000)
+        try:
+            last = get_vps_status(page, acc)
+        except Exception:
+            continue
+        if last in RUNNING_STATES:
+            log(f"✅ 容器已启动（状态: {last}）")
+            return "started", last
+    log(f"❌ 开机指令已下发，但 {START_WAIT} 秒内状态仍为 {last}")
+    return "start_failed", f"{START_WAIT} 秒内状态仍为 {last}"
 
 
-# ───────────────────────── 代理选择 ─────────────────────────
-PROXY_CACHE = {}  # 代理 URL -> 出口 IP / None，同一个代理只检测一次
+def vm_note(state, detail):
+    """续期流程里附加在结果后的容器状态说明，返回 (后缀, 是否致命)。"""
+    return {
+        "running": ("", False),
+        "started": ("；容器已停止，已自动开机", False),
+        "start_failed": (f"；容器开机失败（{detail}）", True),
+        "unknown": (f"；容器状态异常（{detail}，未自动处理）", False),
+        "error": ("；容器状态检查失败", False),
+    }[state]
+
+
+def status_outcome(state, detail, days):
+    """状态检查模式下的结果，返回 (status, 说明)。"""
+    if state == "running":
+        return "ok", f"运行中（剩余 {days} 天）" if days is not None else "运行中"
+    if state == "started":
+        return "started", "容器已停止，已自动开机"
+    if state == "start_failed":
+        return "failed", f"容器已停止，开机失败（{detail}）"
+    if state == "unknown":
+        return "failed", f"容器状态异常：{detail}（未自动处理）"
+    return "failed", f"无法获取容器状态（{detail}）"
+
+
+# ───────────────────────── 代理 ─────────────────────────
+def build_proxy(url):
+    """代理 URL -> Playwright proxy 参数。支持 http/https/socks5，可带账号密码。"""
+    if not url:
+        return None
+    u = urlparse(url)
+    scheme = {"socks5h": "socks5"}.get(u.scheme, u.scheme)
+    if scheme not in ("http", "https", "socks5", "socks4") or not u.hostname or not u.port:
+        raise ValueError("代理格式应为 scheme://[user:pass@]host:port（http/https/socks5）")
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    proxy = {"server": f"{scheme}://{host}:{u.port}"}
+    if u.username:
+        if scheme.startswith("socks"):
+            log("⚠️ Chromium 不支持带账号密码的 SOCKS5，请改用 NODE_LINK（sing-box）或 HTTP 代理")
+        proxy["username"] = unquote(u.username)
+        proxy["password"] = unquote(u.password or "")
+    return proxy
 
 
 def check_proxy(p, url):
-    """经该代理访问 ipify。成功返回出口 IP，失败返回 None（结果按 URL 缓存）。"""
-    if url in PROXY_CACHE:
-        return PROXY_CACHE[url]
+    """经该代理访问 ipify。成功返回出口 IP，失败返回 None（偶发抖动重试一次）。"""
     try:
         pr = build_proxy(url)
     except ValueError as e:
         log(f"⚠️ {e}")
-        PROXY_CACHE[url] = None
         return None
-    ip = None
-    for attempt in (1, 2):  # 偶发抖动给一次重试机会
+    for attempt in (1, 2):
         browser = None
         try:
             browser = p.chromium.launch(headless=True, proxy=pr,
@@ -463,102 +453,16 @@ def check_proxy(p, url):
             page = browser.new_page()
             page.goto("https://api.ipify.org", timeout=20000)
             text = page.inner_text("body").strip()
-            ip = text if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", text) else None
+            if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", text):
+                return text
         except Exception:
-            ip = None
+            pass
         finally:
             if browser:
                 browser.close()
-        if ip:
-            break
         if attempt == 1:
             time.sleep(3)
-    PROXY_CACHE[url] = ip
-    return ip
-
-
-NODE_SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "tuic")
-
-
-def is_node_link(v):
-    """是否需要经 sing-box 转换的节点链接。带账号密码的 socks5 Chromium 不支持，也交给 sing-box。"""
-    scheme = v.split("://", 1)[0].lower() if "://" in v else ""
-    if scheme in NODE_SCHEMES:
-        return True
-    return scheme.startswith("socks") and bool(urlparse(v).username)
-
-
-def resolve_account_proxies(accounts):
-    """把各账号 proxy 里的节点链接启动成本地 SOCKS5 入口（同一条链接只启动一次），结果写入 acc["proxy_url"]。
-
-    proxy_url 为 None 表示该账号配置了专用代理但节点不可用（之后会降级到全局代理）。
-    """
-    links = list(dict.fromkeys(a["proxy"] for a in accounts if a["proxy"] and is_node_link(a["proxy"])))
-    mapping = {}
-    if links:
-        import setup_proxy  # 与本文件同目录
-        log(f"为账号专用的 {len(links)} 个节点链接启动 sing-box …")
-        mapping = dict(zip(links, setup_proxy.start_nodes(links, base_port=2080, tag="_acc", label="专用节点")))
-    for a in accounts:
-        raw = a["proxy"]
-        a["proxy_url"] = (mapping.get(raw) if is_node_link(raw) else raw) if raw else ""
-
-
-def iter_choices(p, acc, blocked_keys, info):
-    """按优先级依次产出该账号可用的出口：专用代理 → 全局代理。
-
-    调用方用完一个出口后若发现它被 Cloudflare 拦截，把它加入 blocked_keys 再取下一个即可。
-    规则：
-      · 有专用代理 → 先用专用代理；连不上、节点启动失败或被 Cloudflare 拦截 → 自动改用全局代理
-      · 没有专用代理 → 用全局代理；全局代理不可用 → 取消该账号（不直连）
-      · 全局代理（含 NODE_LINK 启动失败）与专用代理都不可用/被拦截 → 取消该账号
-      · 完全没有配置任何代理 → 直连
-    取消原因写入 info["note"]。
-    """
-    cands = []  # (名称, 代理地址；None 表示节点不可用)
-    if acc["proxy"]:
-        cands.append(("专用代理", acc["proxy_url"] or None))
-    if PROXY and PROXY != acc["proxy_url"]:
-        cands.append(("全局代理", PROXY))
-
-    if not cands:
-        if GLOBAL_PROXY_FAILED:
-            log("❌ 全局代理不可用，且该账号未配置专用代理，已取消（不会直连）")
-            info["note"] = "全局代理失效且无专用代理，已取消"
-        elif "(direct)" in blocked_keys:
-            log("⏭ 跳过：直连出口已被 Cloudflare 拦截，继续尝试只会更糟")
-            info["note"] = "跳过（出口 IP 已被拦截）"
-        else:
-            yield {"url": None, "via": "直连", "key": "(direct)"}
-        return
-
-    if GLOBAL_PROXY_FAILED and not PROXY:
-        log("⚠️ 全局代理启动失败，仅尝试该账号的专用代理")
-
-    reason, skipped_blocked = "", False
-    for name, url in cands:
-        if url is None:
-            log(f"⚠️ {name}不可用（节点未能启动）")
-            reason = "失效"
-            continue
-        if url in blocked_keys:
-            log(f"⏭ {name}出口已被 Cloudflare 拦截，跳过")
-            skipped_blocked, reason = True, "被拦截"
-            continue
-        ip = check_proxy(p, url)
-        if not ip:
-            log(f"⚠️ {name}不可用")
-            reason = "失效"
-            continue
-        via = name
-        if reason:
-            via = f"{name}（专用代理{reason}）"
-            log(f"⚠️ 专用代理{reason}，已自动改用{name}")
-        log(f"{name}可用，出口 IP: {mask(ip, 3)}")
-        yield {"url": url, "via": via, "key": url}
-        reason = "被拦截"  # 调用方回来继续取下一个，说明刚才这个出口被 Cloudflare 拦截了
-
-    info["note"] = "跳过（出口 IP 已被拦截）" if skipped_blocked else "代理全部失效，已取消"
+    return None
 
 
 # ───────────────────────── Telegram 推送 ─────────────────────────
@@ -583,47 +487,40 @@ def tg_send(text):
     return False
 
 
-def should_notify(results, errors):
-    if errors and not results:
-        return True
-    failed = any(s == "failed" for _, s, _, _ in results)
-    changed = any(s == "renewed" or "（" in v for _, s, _, v in results)
-    return {"always": True, "fail": failed, "change": failed or changed}.get(TG_NOTIFY, True)
+def should_notify(status):
+    return {"always": True, "fail": status == "failed", "change": status != "ok"}.get(TG_NOTIFY, True)
 
 
-def build_report(results, errors):
+def build_report(status, note, title="NeoHeberg 续期报告"):
     bj = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    icon = {"renewed": "✅", "ok": "✔️", "failed": "❌"}
-    failed = sum(1 for _, s, _, _ in results if s == "failed")
-    lines = [f"<b>NeoHeberg 续期报告</b>", f"🕐 {bj}（北京时间）", ""]
-    for name, status, note, via in results:
-        tail = f" · <i>{html.escape(via)}</i>" if "（" in via else ""
-        lines.append(f"{icon[status]} <b>{html.escape(name)}</b>：{html.escape(note)}{tail}")
-    for e in errors:
-        lines.append(f"⚠️ 配置提示：{html.escape(e)}")
-    lines += ["", f"成功 {len(results) - failed} / 失败 {failed} / 共 {len(results)}"]
+    icon = {"renewed": "✅", "ok": "✔️", "started": "🔄", "failed": "❌"}[status]
+    lines = [f"<b>{html.escape(title)}</b>", f"🕐 {bj}（北京时间）", "", f"{icon} {html.escape(note)}"]
     repo, run = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID")
     if repo and run:
-        lines.append(f'<a href="{os.environ.get("GITHUB_SERVER_URL", "https://github.com")}/{repo}/actions/runs/{run}">查看运行日志</a>')
+        server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        lines += ["", f'<a href="{server}/{repo}/actions/runs/{run}">查看运行日志</a>']
     return "\n".join(lines)
 
 
-# ───────────────────────── 单个账号 ─────────────────────────
-def process_account(p, acc, choice):
-    """处理一个账号（出口已由 iter_choices 选好）。返回 dict: status(renewed/ok/failed), note, blocked, via。"""
-    via = choice["via"]
-    result = lambda status, note, blocked=False: {"status": status, "note": note, "blocked": blocked, "via": via}
+# ───────────────────────── 主流程 ─────────────────────────
+def run(p):
+    """执行一次任务，返回 (status, note)。status: renewed / ok / started / failed。"""
+    # ── 代理：配置了就必须可用，绝不悄悄直连 ──
+    if PROXY:
+        ip = check_proxy(p, PROXY)
+        if not ip:
+            log("❌ 代理不可用，本次取消（不会直连）")
+            return "failed", "代理不可用，已取消（不会直连）"
+        host = urlparse(PROXY).hostname or ""
+        log(f"使用代理: {urlparse(PROXY).scheme}://{mask(host, 3)}，出口 IP: {mask(ip, 3)}")
+    elif PROXY_FAILED:
+        log("❌ 配置了代理（NODE_LINK）但启动失败，本次取消（不会直连）")
+        return "failed", "代理启动失败，已取消（不会直连）"
 
-    proxy_url = choice["url"]
     kw = dict(headless=True, args=["--disable-blink-features=AutomationControlled",
                                    "--no-sandbox", "--disable-dev-shm-usage"])
-    if proxy_url:
-        try:
-            kw["proxy"] = build_proxy(proxy_url)
-        except ValueError as e:
-            log(f"❌ {e}")
-            return result("failed", "代理配置错误")
-        log(f"使用{via}: {kw['proxy']['server'].split('://')[0]}://{mask(urlparse(proxy_url).hostname, 3)}")
+    if PROXY:
+        kw["proxy"] = build_proxy(PROXY)
 
     browser = p.chromium.launch(**kw)
     try:
@@ -631,10 +528,9 @@ def process_account(p, acc, choice):
         page = ctx.new_page()
         page.set_default_timeout(30000)
         try:
-            res = login(page, ctx, acc["user"], acc["password"])
+            res = login(page, ctx, USER, PASSWORD)
             if res is not True:
-                note = {BLOCKED: "被 Cloudflare 拦截", BADCREDS: "账号或密码错误"}.get(res, "登录失败")
-                return result("failed", note, res == BLOCKED)
+                return "failed", {BLOCKED: "被 Cloudflare 拦截", BADCREDS: "账号或密码错误"}.get(res, "登录失败")
             log("✅ 登录成功")
 
             csrf, exp, days = panel_info(page)
@@ -642,104 +538,66 @@ def process_account(p, acc, choice):
             if not csrf:
                 log("❌ 未取到 CSRF token")
                 snap(page, "no_csrf")
-                return result("failed", "未取到 CSRF token")
+                return "failed", "未取到 CSRF token"
 
-            threshold = acc["renew_days"]
-            if FORCE_RENEW or days is None or days <= threshold:
+            if STATUS_ONLY:  # 状态检查模式：只检查容器、停止则开机，不续期
+                state, detail = ensure_running(page, csrf, ACC)
+                return status_outcome(state, detail, days)
+
+            if FORCE_RENEW or days is None or days <= RENEW_DAYS:
                 if FORCE_RENEW:
                     log("已指定强制续期")
-                hint, msg = do_renew(page, csrf, acc)
+                hint, msg = do_renew(page, csrf, ACC)
                 _, exp2, days2 = panel_info(page)
                 log(f"续期后到期日: {exp2}  剩余: {days2} 天")
                 ok, note = renewal_outcome(exp, days, exp2, days2, hint, msg)
                 log(("✅ " if ok else "❌ ") + note)
-                keep_running(page, csrf, acc)
-                return result("renewed" if ok else "failed", note)
+                state, detail = ensure_running(page, csrf, ACC)
+                suffix, fatal = vm_note(state, detail)
+                return ("renewed" if ok and not fatal else "failed"), note + suffix
 
-            log(f"剩余天数 > {threshold}，本次无需续期")
-            keep_running(page, csrf, acc)
-            return result("ok", f"无需续期（剩余 {days} 天）")
+            log(f"剩余天数 > {RENEW_DAYS}，本次无需续期")
+            state, detail = ensure_running(page, csrf, ACC)
+            suffix, fatal = vm_note(state, detail)
+            status = "failed" if fatal else ("started" if state == "started" else "ok")
+            return status, f"无需续期（剩余 {days} 天）" + suffix
         except Exception as e:
             log(f"❌ 处理异常: {type(e).__name__}: {str(e)[:150]}")
             snap(page, "error")
-            return result("failed", f"异常: {type(e).__name__}")
+            return "failed", f"异常: {type(e).__name__}"
     finally:
         browser.close()
 
 
-# ───────────────────────── 主流程 ─────────────────────────
 def main():
-    global LABEL, FILE_TAG
     for secret in (TG_TOKEN, TG_CHAT):  # 让 Actions 日志屏蔽 TG 凭据
         if secret:
             print(f"::add-mask::{secret}", flush=True)
 
-    accounts, errors = parse_accounts()
-    for e in errors:
-        log(f"⚠️ 配置问题: {e}")
-    if not accounts:
-        log("❌ 没有可用的账号配置")
-        tg_send("❌ <b>NeoHeberg 续期</b>：没有可用的账号配置\n" + "\n".join(html.escape(e) for e in errors))
+    title = "NeoHeberg 状态检查" if STATUS_ONLY else "NeoHeberg 续期报告"
+    missing = [n for n, v in (("NEO_USER", USER), ("NEO_PASSWORD", PASSWORD), ("NEO_VMID", VMID)) if not v]
+    if missing:
+        log(f"❌ 缺少配置: {', '.join(missing)}（请在仓库 Secrets 里设置 NEO_USER / NEO_PASSWORD / NEO_VMID）")
+        tg_send(f"❌ <b>{html.escape(title)}</b>：缺少配置 {html.escape(', '.join(missing))}")
         return 1
 
-    # 让 Actions 日志屏蔽账号和密码（防止公开仓库泄露）
-    for a in accounts:
-        for v in (a["password"], a["user"], a["proxy"]):
-            if v and len(v) >= 4 and "\n" not in v:
-                print(f"::add-mask::{v}", flush=True)
+    for v in (USER, PASSWORD):  # 让 Actions 日志屏蔽账号和密码（防止公开仓库泄露）
+        if len(v) >= 4 and "\n" not in v:
+            print(f"::add-mask::{v}", flush=True)
 
-    total = len(accounts)
-    log(f"共 {total} 个账号，续期阈值默认 {RENEW_DAYS} 天" + ("，强制续期" if FORCE_RENEW else ""))
-    results, blocked_keys, ran = [], set(), False
-
-    if GLOBAL_PROXY_FAILED and not PROXY:
-        log("⚠️ 配置了全局代理但不可用：配置了可用专用代理的账号继续，其余账号将被取消（不会直连）")
-    resolve_account_proxies(accounts)
+    log(("状态检查模式：只检查容器状态，已停止则自动开机，不续期" if STATUS_ONLY
+         else f"续期模式：续期阈值 {RENEW_DAYS} 天" + ("，强制续期" if FORCE_RENEW else "")))
+    log(f"账号={mask(USER)}（{len(USER)}位） 密码={len(PASSWORD)}位 实例={mask(VMID)}")
 
     with sync_playwright() as p:
-        for i, acc in enumerate(accounts, 1):
-            LABEL = acc["name"] if total > 1 else ""
-            FILE_TAG = f"acc{i}_" if total > 1 else ""
+        status, note = run(p)
 
-            info, final, last_blocked, tried = {}, None, None, 0
-            for choice in iter_choices(p, acc, blocked_keys, info):
-                if tried:
-                    time.sleep(5)  # 同一账号换出口重试前稍等
-                elif ran:  # 账号之间留间隔，避免触发站点限流
-                    gap = ACCOUNT_GAP + random.uniform(0, 15)
-                    log(f"等待 {gap:.0f}s 后处理下一个账号 …")
-                    time.sleep(gap)
-                ran, tried = True, tried + 1
-
-                if tried == 1:
-                    log(f"开始处理（{i}/{total}）：账号={mask(acc['user'])}（{len(acc['user'])}位） "
-                        f"密码={len(acc['password'])}位 实例={mask(acc['vmid'])}")
-                res = process_account(p, acc, choice)
-                if res["blocked"]:  # 被 Cloudflare 拦截：记下这个出口，换下一个
-                    blocked_keys.add(choice["key"])
-                    last_blocked = res
-                    continue
-                final = res
-                break
-
-            if final is None:
-                if last_blocked:
-                    final = dict(last_blocked, note="被 Cloudflare 拦截" + ("（所有出口均被拦截）" if tried > 1 else ""))
-                else:
-                    final = {"status": "failed", "note": info.get("note", "代理全部失效，已取消"), "via": ""}
-            results.append((acc["name"], final["status"], final["note"], final["via"]))
-
-    LABEL = ""
-    log("═════════ 汇总 ═════════")
-    icon = {"renewed": "✅", "ok": "✔️", "failed": "❌"}
-    for name, status, note, via in results:
-        log(f"{icon[status]} {name}: {note}" + (f"  [{via}]" if via else ""))
-    failed = sum(1 for _, s, _, _ in results if s == "failed")
-    log(f"成功 {len(results) - failed} / 失败 {failed} / 共 {len(results)}")
-
-    if should_notify(results, errors):
-        tg_send(build_report(results, errors))
-    return 1 if failed else 0
+    icon = {"renewed": "✅", "ok": "✔️", "started": "🔄", "failed": "❌"}[status]
+    log("═════════ 结果 ═════════")
+    log(f"{icon} {note}")
+    if should_notify(status):
+        tg_send(build_report(status, note, title))
+    return 1 if status == "failed" else 0
 
 
 if __name__ == "__main__":
