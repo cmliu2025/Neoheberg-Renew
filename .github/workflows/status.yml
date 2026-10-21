@@ -1,0 +1,77 @@
+name: Neoheberg Status
+
+# 服务器状态检查：定时登录，检查容器是否在运行，已停止则自动开机并确认。
+# 只检查状态、不续期（续期由 renew.yml 每周执行）。
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # 每 6 小时一次：UTC 00:17 / 06:17 / 12:17 / 18:17，可按需改成 "17 */12 * * *"（每 12 小时）或 "17 3 * * *"（每天）
+  workflow_dispatch:         # 可在 Actions 页面手动触发
+
+permissions:
+  contents: read
+
+# 与 renew.yml 共用同一个账号：排队依次执行，避免同时登录触发站点限流
+concurrency:
+  group: neoheberg
+  cancel-in-progress: false
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # 代理，配置方式同 renew.yml
+      - name: Setup proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          USER_PROXY: ${{ secrets.PROXY_SERVER }}
+        run: python setup_proxy.py || echo "PROXY_FAILED=1" >> "$GITHUB_ENV"
+
+      - name: Check server status
+        id: status
+        env:
+          MODE: status
+          NEO_USER: ${{ secrets.NEO_USER }}
+          NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}
+          NEO_VMID: ${{ secrets.NEO_VMID }}
+          # 可选（Variables 里设置，留空用默认值）：START_WAIT 默认 90（秒），开机后最多等多久确认运行起来
+          START_WAIT: ${{ vars.START_WAIT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 状态检查很频繁，默认只在"有变化"时推送（自动开机了 / 出错了）；
+          # 想改成每次都推送或仅失败才推送：Variables 里设置 STATUS_TG_NOTIFY = always / change / fail
+          TG_NOTIFY: ${{ vars.STATUS_TG_NOTIFY || 'change' }}
+        run: python renew.py
+
+      - name: Notify Telegram (failed before check)
+        if: failure() && steps.status.outcome == 'skipped'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+          curl -sS -m 20 -o /dev/null "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=❌ NeoHeberg 状态检查任务在启动阶段失败：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+
+      - name: Upload debug files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
